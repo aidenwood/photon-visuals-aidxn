@@ -1,3 +1,7 @@
+# RETIRED 2026-10-13: encodes the SINGLE-CURSOR DXT5 model, which is DISPROVEN.
+# DXT5 has two plane cursors - see src/dxv.rs::decompress_dxt5 and tools/d5dec.py.
+# Kept only as a record of how the wrong model was scored. Do not import.
+
 """Readable 64x64 DXT5 probe harness.
 Block layout that is fully readable from RGBA:
   unit0 = a0 | a1<<8        (alpha endpoints; alpha idx bits all 0 => every texel alpha = a0)

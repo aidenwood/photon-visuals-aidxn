@@ -12,6 +12,12 @@
 //! Tags: `DXT1` -> BC1 (8 B/block), `DXT5` -> BC3 (16 B/block),
 //! `YCG6`/`YG10` -> BC3-shaped YCoCg.
 //!
+//! `DXT1` and `DXT5` are both derived and verified byte-exact against ffmpeg.
+//! They are **two different schemes**, not one scheme with two block sizes:
+//! DXT1 codes whole blocks with a SPLIT escape, DXT5 (ffmpeg calls it `DXTR5`)
+//! codes two independent planes — see `decompress_dxt5`. `YCG6`/`YG10` are
+//! still `NotDerived`.
+//!
 //! # Compressed stream (VERIFIED for DXT1)
 //!
 //! Output is a sequence of 4-byte little-endian **units**. A BC1 block is 2 units:
@@ -61,10 +67,14 @@ use std::fmt;
 #[derive(Debug)]
 pub enum Error {
     Truncated,
-    BadDistance { dist: usize, available: usize },
+    BadDistance {
+        dist: usize,
+        available: usize,
+    },
     UnsupportedTag([u8; 4]),
     ShortPayload,
-    /// The format for this tag has not been reverse-engineered. See `decompress_dxt5`.
+    /// The format for this tag has not been reverse-engineered. `YCG6`/`YG10` only;
+    /// `DXT1` and `DXT5` are both derived.
     NotDerived,
 }
 
@@ -77,10 +87,7 @@ impl fmt::Display for Error {
             }
             Error::UnsupportedTag(t) => write!(f, "unsupported tag {:?}", std::str::from_utf8(t)),
             Error::ShortPayload => write!(f, "payload shorter than header"),
-            Error::NotDerived => write!(
-                f,
-                "DXT5/YCoCg compressed layout not derived - see dxv::decompress_dxt5"
-            ),
+            Error::NotDerived => write!(f, "YCoCg (YCG6/YG10) compressed layout not derived"),
         }
     }
 }
@@ -103,7 +110,12 @@ struct Reader<'a> {
 impl<'a> Reader<'a> {
     #[inline]
     fn new(b: &'a [u8]) -> Self {
-        Reader { b, p: 0, mask: 0, nbits: 0 }
+        Reader {
+            b,
+            p: 0,
+            mask: 0,
+            nbits: 0,
+        }
     }
     #[inline]
     fn u8(&mut self) -> Result<u32, Error> {
@@ -134,6 +146,22 @@ impl<'a> Reader<'a> {
         self.p += 4;
         Ok(v)
     }
+    /// DXT5 length code: `u8`, and if it is 0xFF keep adding `u16`s while each is
+    /// 0xFFFF. Used by both alpha-plane run ops.
+    #[inline]
+    fn varint(&mut self) -> Result<usize, Error> {
+        let mut n = self.u8()? as usize;
+        if n == 0xff {
+            loop {
+                let w = self.u16()? as usize;
+                n += w;
+                if w != 0xffff {
+                    break;
+                }
+            }
+        }
+        Ok(n)
+    }
     /// Next 2-bit op code, LSB-first, refilling the 32-bit mask from the stream.
     #[inline]
     fn op(&mut self) -> Result<u32, Error> {
@@ -151,7 +179,10 @@ impl<'a> Reader<'a> {
 #[inline]
 fn copy_unit(out: &mut [u32], pos: usize, dist: usize) -> Result<(), Error> {
     if dist == 0 || dist > pos {
-        return Err(Error::BadDistance { dist, available: pos });
+        return Err(Error::BadDistance {
+            dist,
+            available: pos,
+        });
     }
     out[pos] = out[pos - dist];
     Ok(())
@@ -166,68 +197,197 @@ pub fn decompress_dxt1(payload: &[u8], n_units: usize) -> Result<Vec<u8>, Error>
     Ok(units_to_bytes(&units))
 }
 
-/// DXV3 `DXT5` / `YCG6` / `YG10` — **INCOMPLETE, deliberately refuses.**
+/// DXV3 `DXT5` — ffmpeg calls the scheme `DXTR5` ("DXTR5 compression with DXT5
+/// texture" in its own trace). **VERIFIED byte-exact against ffmpeg on real Resolume
+/// assets, 1080p and 4K.**
 ///
-/// ffmpeg calls this scheme `DXTR5` (its own trace output: "DXTR5 compression with
-/// DXT5 texture"), and it is a genuinely different codepath from the DXT1 one above —
-/// not a reparameterisation of it. Everything below was measured against real
-/// Resolume assets plus crafted payloads fed to ffmpeg's decoder; enough is known to
-/// finish it, but not enough to decode a real frame, so this returns an error rather
-/// than plausible-looking wrong pixels.
+/// It is a genuinely different codepath from the DXT1 one above, not a
+/// reparameterisation of it. The structural insight that unlocks it:
 ///
-/// ## Verified
-/// * Texture layout is ordinary BC3: 16-byte blocks, 8 B alpha + 8 B BC1-style
-///   colour. RAW mode (compression flag != 0) decodes correctly — see `bc3.rs`.
-/// * The payload opens with a **16-byte unconditional literal** = block 0. Proved by
-///   byte mutation on a real frame: byte 0 moves the alpha of pixel 0, bytes 8..12
-///   move its RGB.
+/// # Two planes, one flag stream
+///
+/// A BC3 block is `[8 B alpha half][8 B colour half]`. The compressor treats those as
+/// **two independent LZ planes**. Each has its own block cursor — `ap` for alpha,
+/// `cp` for colour — and before every op the decoder picks **whichever plane is
+/// behind** (alpha wins ties). They therefore alternate A,C,A,C… in the common case,
+/// but an alpha-plane run can push `ap` far ahead, after which a long stretch of
+/// colour ops runs back to back. That is why a single position-dependent table
+/// appeared to contradict itself: the "position" is not the output cursor's parity,
+/// it is which plane is currently behind.
+///
+/// Distances are expressed in **u32 units over the whole interleaved texture**, so a
+/// plane's back-reference always lands on the same half of an earlier block.
+///
+/// # Stream layout
+///
+/// * The payload opens with a **16-byte unconditional literal** = block 0 (both
+///   halves). `ap = cp = 1` after it. Proved by byte mutation on a real frame: byte 0
+///   moves the alpha of pixel 0, bytes 8..12 move its RGB.
 /// * Flag bits are read exactly like DXT1: 32-bit LE mask words pulled lazily from
-///   the stream, consumed LSB-first, two bits per op.
-/// * Op granularity is the **8-byte half-block**, and the code table is
-///   **position-dependent**: a different table applies when the output cursor is
-///   block-aligned ("alpha half") versus mid-block ("colour half"). A single table
-///   cannot explain the measurements — e.g. code `11` consumes 8 bytes at a
-///   block-aligned cursor and 2 bytes one op later.
-/// * Distances are the DXT1 formulas scaled to 8-byte units, in u32 units:
-///   `SHORT = 4*b + 8`, `LONG = 4*(v + 256) + 8`. Confirmed by sweeping b and v.
-/// * Block-aligned `00` = RUN. Reads a 0xFF-continuation varint N (each 0xFF adds
-///   255, first byte < 0xFF terminates) and copies **N+1 whole blocks** from 16 bytes
-///   back. Confirmed with marker literals for N = 0,1,2,3,5,10: the next literal
-///   lands at block N+2 every time. This is what makes a 37-byte 4K frame possible.
-/// * Block-aligned `11` = LITERAL, 8 bytes (the alpha half). Confirmed by encoding a
-///   chosen alpha sequence and reading it back out of ffmpeg unchanged.
-/// * Mid-block `01` = COPY, 8 bytes from 16 bytes back. Same round-trip proof.
-/// * Mid-block `10` = SHORT match. Mid-block `00` and `11` both behave as LONG
-///   matches with identical distances — they must differ in some way (emit count or a
-///   trailing run length) that an out-of-range-distance probe cannot reveal.
+///   the stream, consumed LSB-first, two bits per op, so mask words sit interleaved
+///   with the data bytes.
+/// * Output is zero-initialised.
 ///
-/// ## Not resolved
-/// * Block-aligned codes `01` and `10`.
-/// * What separates mid-block `00` from mid-block `11`.
-/// * Consequently no end-to-end decode: the best partial model consumed 316 of
-///   106,242 bytes of a real frame before desyncing.
-/// * `YG10` additionally carries a 16-byte header of four u32s before the stream
-///   (observed `618, 69, 69, 0` on a 761-byte frame) that `DXT5` does not have.
-///   Probably sub-stream sizes for the Y/Co/Cg/A planes. Unanalysed.
+/// # Length encoding (`varint`)
 ///
-/// The probing tools that produced all of the above are in `tools/` — `d5.py` is the
-/// readable 64x64 DXT5 harness, `mutate.py` does byte-mutation mapping against real
-/// files, and ffmpeg must be run at `-v trace` for DXT5 (its `idx N > M` diagnostic
-/// is suppressed at `-v error`, which is what hid the oracle at first).
-pub fn decompress_dxt5(_payload: &[u8], _n_units: usize) -> Result<Vec<u8>, Error> {
-    Err(Error::NotDerived)
+/// `n = u8; if n == 0xFF { loop { w = u16_le; n += w; if w != 0xFFFF { break } } }`.
+/// Both run ops use it. Provenance: the first op of
+/// `6 Surreal Creatures 4K_DXV.mov` frame 0 is `ff ff ff ff ff ff ff 28 c7` =
+/// 255 + 0xFFFF*3 + 0xC728 = 247844, and ffmpeg's first non-transparent block in that
+/// frame is exactly 247846 = 1 + 247844 + 1. The simpler "each 0xFF adds 255" reading
+/// gives 1825 and desyncs immediately.
+///
+/// # Alpha-plane ops (write the 8-byte alpha half of block `ap`)
+///
+/// | code | op | extra bytes | effect |
+/// |------|----|-------------|--------|
+/// | `00` | BLOCK RUN | varint `n` | copy `n+1` **whole blocks** (all 4 units) from 1 block back; advances **both** `ap` and `cp` |
+/// | `01` | ALPHA RUN | varint `n` | copy `n+1` **alpha halves** from 1 block back; advances `ap` only |
+/// | `10` | MATCH     | 2 (`u16 v`) | copy one alpha half from distance `4*v + 8` units |
+/// | `11` | LITERAL   | 8           | one alpha half verbatim |
+///
+/// Note the alpha plane has no short/long split: one match op with a full u16
+/// distance. Measuring it as a 1-byte op is the trap — every lab probe happened to
+/// have a zero second byte, and the two readings only diverge on real data.
+///
+/// # Colour-plane ops (write the 8-byte colour half of block `cp`)
+///
+/// | code | op | extra bytes | effect |
+/// |------|----|-------------|--------|
+/// | `00` | SPLIT   | —            | two sub-ops, one per u32 unit (see below) |
+/// | `01` | COPY    | 0            | copy the colour half from 1 block back |
+/// | `10` | SHORT   | 1 (`u8 b`)   | copy from distance `4*b + 8` units |
+/// | `11` | LONG    | 2 (`u16 v`)  | copy from distance `4*(v + 256) + 8` units |
+///
+/// SPLIT sub-ops use the same alphabet on a **single** unit, and `00` is the literal
+/// that lets a brand-new colour word enter the stream at all:
+///
+/// | sub | op | extra bytes | effect |
+/// |-----|----|-------------|--------|
+/// | `00` | LITERAL | 4           | one unit verbatim |
+/// | `01` | COPY    | 0           | one unit from 1 block back |
+/// | `10` | SHORT   | 1 (`u8 b`)  | one unit from `4*b + 8` |
+/// | `11` | LONG    | 2 (`u16 v`) | one unit from `4*(v + 256) + 8` |
+///
+/// # Not derived
+///
+/// `YCG6` / `YG10` still return `NotDerived`, and they are **not** this scheme with a
+/// header bolted on — ffmpeg names them differently in its own trace: `YOCOCG6` and
+/// `YAOCOCG10`, versus `DXTR5` here. Both carry a 16-byte header of four u32s that
+/// `DXT5` does not (`YCG6`: `11612, 2922, 0, 0` on a 12803-byte frame; `YG10`:
+/// `10270, 2391, 2081, 0` on a 20074-byte frame), consistent with sub-stream sizes
+/// for separate Y/Co/Cg(/A) planes. Feeding the bytes after that header to
+/// `decompress_dxt5` desyncs within ~30 bytes on every frame tried, so the
+/// "same scheme, extra header" shortcut is ruled out, not merely untested.
+///
+/// # Provenance
+///
+/// Tools in `tools/`: `d5lab.py` builds payloads op-by-op with explicit control of the
+/// data byte stream, `d5trace.py` single-steps the cursor, `d5dec.py` is the reference
+/// model that was scored against ffmpeg frame by frame. ffmpeg must be run at
+/// `-v trace` for DXT5 — its `idx N > M` diagnostic (N = computed distance,
+/// M = colour cursor) is suppressed at `-v error`, and only the colour plane prints
+/// it; an out-of-range alpha reference fails silently.
+///
+/// The model is proven in **both** directions, not merely permissive: an encoder
+/// built from this table was used to compress three synthetic 1920x1080 BC3
+/// textures, chosen to exercise every op and sub-op, and ffmpeg decoded all three to
+/// the intended texture with 0 of 2,073,600 texels wrong each time.
+pub fn decompress_dxt5(payload: &[u8], n_units: usize) -> Result<Vec<u8>, Error> {
+    // A BC3 block is exactly 4 units; a non-multiple would leave a partial block the
+    // plane cursors cannot address, so refuse rather than silently zero-fill it.
+    if payload.len() < 16 || n_units < 4 || n_units % 4 != 0 {
+        return Err(Error::ShortPayload);
+    }
+    let nb = n_units / 4;
+    let mut out = vec![0u32; n_units];
+    let mut r = Reader::new(payload);
+
+    for u in out.iter_mut().take(4) {
+        *u = r.u32()?;
+    }
+    let (mut ap, mut cp) = (1usize, 1usize);
+
+    while ap < nb || cp < nb {
+        let c = r.op()?;
+        if ap <= cp && ap < nb {
+            match c {
+                0 => {
+                    // whole-block run: advances both planes
+                    let n = r.varint()? + 1;
+                    for _ in 0..n {
+                        if ap >= nb {
+                            break;
+                        }
+                        for k in 0..4 {
+                            copy_unit(&mut out, ap * 4 + k, 4)?;
+                        }
+                        ap += 1;
+                    }
+                    if cp < ap {
+                        cp = ap;
+                    }
+                }
+                1 => {
+                    let n = r.varint()? + 1;
+                    for _ in 0..n {
+                        if ap >= nb {
+                            break;
+                        }
+                        copy_half(&mut out, ap * 4, 4)?;
+                        ap += 1;
+                    }
+                }
+                2 => {
+                    let d = 4 * r.u16()? as usize + 8;
+                    copy_half(&mut out, ap * 4, d)?;
+                    ap += 1;
+                }
+                _ => {
+                    out[ap * 4] = r.u32()?;
+                    out[ap * 4 + 1] = r.u32()?;
+                    ap += 1;
+                }
+            }
+        } else {
+            let base = cp * 4 + 2;
+            match c {
+                0 => {
+                    for k in 0..2 {
+                        match r.op()? {
+                            0 => out[base + k] = r.u32()?,
+                            1 => copy_unit(&mut out, base + k, 4)?,
+                            2 => {
+                                let d = 4 * r.u8()? as usize + 8;
+                                copy_unit(&mut out, base + k, d)?;
+                            }
+                            _ => {
+                                let d = 4 * (r.u16()? as usize + 256) + 8;
+                                copy_unit(&mut out, base + k, d)?;
+                            }
+                        }
+                    }
+                }
+                1 => copy_half(&mut out, base, 4)?,
+                2 => {
+                    let d = 4 * r.u8()? as usize + 8;
+                    copy_half(&mut out, base, d)?;
+                }
+                _ => {
+                    let d = 4 * (r.u16()? as usize + 256) + 8;
+                    copy_half(&mut out, base, d)?;
+                }
+            }
+            cp += 1;
+        }
+    }
+    Ok(units_to_bytes(&out))
 }
 
-/// The verified DXT1 op loop, generalised over units-per-block. Exposed so the DXT5
-/// work can be picked up without re-deriving the DXT1 half. `units_per_block == 2`
-/// is the verified path; anything else is a guess.
-pub fn decompress_block_stream(
-    payload: &[u8],
-    n_units: usize,
-    units_per_block: usize,
-) -> Result<Vec<u8>, Error> {
-    let units = decompress_units(payload, n_units, units_per_block)?;
-    Ok(units_to_bytes(&units))
+#[inline]
+fn copy_half(out: &mut [u32], base: usize, dist: usize) -> Result<(), Error> {
+    copy_unit(out, base, dist)?;
+    copy_unit(out, base + 1, dist)
 }
 
 fn units_to_bytes(units: &[u32]) -> Vec<u8> {
@@ -238,10 +398,12 @@ fn units_to_bytes(units: &[u32]) -> Vec<u8> {
     out
 }
 
-/// Core loop. `upb` = units per block (2 for BC1, 4 for BC3-shaped).
+/// Core DXT1 loop. `upb` = units per block, always 2 here.
 ///
-/// For `upb == 2` every rule here is measured. For `upb == 4` the distance scaling
-/// (`2*b + 4` -> `upb*b + 2*upb`) is a hypothesis; see `decompress_dxt5`.
+/// It once took `upb == 4` as a candidate DXT5 path. **That hypothesis is disproven:**
+/// DXT5 is not this loop with a bigger block — it is a two-plane scheme with a
+/// different code table (see `decompress_dxt5`). The parameter is kept only because
+/// it names the invariant the distance formulas rest on.
 fn decompress_units(payload: &[u8], n_units: usize, upb: usize) -> Result<Vec<u32>, Error> {
     if payload.len() < upb * 4 {
         return Err(Error::ShortPayload);
@@ -291,7 +453,10 @@ fn decompress_units(payload: &[u8], n_units: usize, upb: usize) -> Result<Vec<u3
             }
         };
         if dist > pos {
-            return Err(Error::BadDistance { dist, available: pos });
+            return Err(Error::BadDistance {
+                dist,
+                available: pos,
+            });
         }
         // LZ-style forward copy, unit by unit, so overlapping sources work.
         for _ in 0..upb {
@@ -393,6 +558,7 @@ pub fn decode_texture(frame: &Frame<'_>, w: usize, h: usize) -> Result<Vec<u8>, 
     }
     match frame.tag {
         Tag::Dxt1 => decompress_dxt1(frame.payload, n_units),
+        Tag::Dxt5 => decompress_dxt5(frame.payload, n_units),
         _ => Err(Error::NotDerived),
     }
 }

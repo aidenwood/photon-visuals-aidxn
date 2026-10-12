@@ -1,3 +1,7 @@
+# RETIRED 2026-10-13: encodes the SINGLE-CURSOR DXT5 model, which is DISPROVEN.
+# DXT5 has two plane cursors - see src/dxv.rs::decompress_dxt5 and tools/d5dec.py.
+# Kept only as a record of how the wrong model was scored. Do not import.
+
 """Score a candidate DXT5 op table by how many leading BC3 blocks it reproduces.
 
 Decodes a real payload with the candidate table, converts each block to RGBA with the

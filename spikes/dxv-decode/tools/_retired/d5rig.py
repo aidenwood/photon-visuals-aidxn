@@ -1,3 +1,7 @@
+# RETIRED 2026-10-13: encodes the SINGLE-CURSOR DXT5 model, which is DISPROVEN.
+# DXT5 has two plane cursors - see src/dxv.rs::decompress_dxt5 and tools/d5dec.py.
+# Kept only as a record of how the wrong model was scored. Do not import.
+
 """Position-tracking DXT5 probe rig.
 
 Tracks the output cursor in u32 units so every op's slot (block-aligned vs mid-block)

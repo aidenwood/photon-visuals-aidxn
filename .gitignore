@@ -18,3 +18,6 @@ media-cache/
 
 # Compiled spike binaries
 spikes/metal-upload/upload
+
+# Local symlink scratch for DXV probing
+spikes/dxv-decode/d5/

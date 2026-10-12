@@ -28,7 +28,11 @@ pub fn atoms(buf: &[u8], start: usize, end: usize) -> Vec<Atom> {
         if size < hdr || p + size > end {
             break;
         }
-        v.push(Atom { typ, body: p + hdr, end: p + size });
+        v.push(Atom {
+            typ,
+            body: p + hdr,
+            end: p + size,
+        });
         p += size;
     }
     v
