@@ -22,12 +22,21 @@ frame rate than Arena on the same machine, same files, same output.
 
 **Three things worth your attention first:**
 
-1. **🔓 DXV: DXT1 is cracked and verified on YOUR media — 23,823 frames byte-exact** across 36 real
-   Resolume files, 4K and 1080p. The earlier census was wrong: your library is **192 files — 37
-   DXT1, 109 DXT5, 9 YCG6, 11 YG10**, so that is ~20% working rather than 0%. **DXT5 is the
-   remaining blocker** and an agent is on it now, narrowed to three unknown opcode slots. Two
-   findings already banked: DXV stores *premultiplied* RGB (skip it and everything renders dark),
-   and BC3 colour always uses 4-colour interpolation.
+1. **🔓 DXV: DXT1 *and* DXT5 are cracked and verified on YOUR media — 52,407 frames byte-exact**
+   across 147 real Resolume files, 4K and 1080p, 0 mismatches. Round-tripped both directions too
+   (0 of 2,073,600 texels wrong on three synthetic 1080p textures exercising every op).
+
+   The breakthrough: DXT5 is **not** a position-keyed table. It runs **two independent LZ planes**
+   — alpha halves and colour halves, each with its own block cursor, and the plane that is behind
+   takes the next op. They usually alternate, which is why cursor parity *looked* like the key;
+   an alpha run breaks the alternation, and that is where every earlier model desynced.
+
+   Also banked: DXV stores *premultiplied* RGB (skip it and everything renders dark), BC3 colour
+   always uses 4-colour interpolation, and the run varint is `0xFF -> 255 + u16_le`.
+
+   **Remaining: `YCG6` / `YG10` — 190 files, the biggest chunk of your library.** ffmpeg names them
+   `YOCOCG6` / `YAOCOCG10`; they are a genuinely different scheme, *ruled out rather than untested*.
+   That is the next derivation job.
 2. **MIDI learn / control mapping is live** — in the portable core, so Windows gets it free, and
    verified through the real C boundary. Pickup (no jump on bank switch), displaced-binding
    reporting, note-velocity-0, inverted and sub-ranges, four curves. **The UI side is Codex's** —
