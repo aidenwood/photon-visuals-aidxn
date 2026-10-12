@@ -1,0 +1,5 @@
+module PhotonFFI {
+    header "photon_ffi.h"
+    link "photon_ffi"
+    export *
+}

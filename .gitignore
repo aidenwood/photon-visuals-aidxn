@@ -1,0 +1,20 @@
+node_modules
+dist
+.DS_Store
+*.log
+
+# Build artefacts (any depth)
+target/
+.build/
+.swiftpm/
+*.xcuserstate
+ModuleCache/
+
+# Agent scratch
+.codex/artifacts/
+
+# Source media — real Resolume/show assets, not for a public repo
+media-cache/
+
+# Compiled spike binaries
+spikes/metal-upload/upload

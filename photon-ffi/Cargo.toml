@@ -1,0 +1,19 @@
+[package]
+name = "photon-ffi"
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.95"
+description = "C ABI bridge from photon-core to the native shells. The ONLY crate permitted to use unsafe."
+publish = false
+
+[lib]
+# staticlib so the Swift shell links it directly with no dylib to ship or sign.
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+photon-core = { path = "../photon-core" }
+serde_json = "1.0.154"
+
+[profile.release]
+lto = true
+codegen-units = 1

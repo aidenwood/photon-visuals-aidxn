@@ -1,0 +1,35 @@
+[package]
+name = "photon-core"
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.95"
+description = "Photon engine core — portable. Contains NO platform or graphics API. See docs/scaffold.md."
+license = "UNLICENSED"
+publish = false
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+schemars = "0.8"
+thiserror = "2"
+
+[dev-dependencies]
+pretty_assertions = "1"
+
+# ── Dependency policy ────────────────────────────────────────────────────────
+# This crate is consumed by BOTH the macOS (Swift/Metal) and the later Windows
+# shell. It must stay portable.
+#
+# NEVER add here:
+#   - Apple binding crates (objc, objc2*, core-foundation, core-graphics,
+#     core-video, metal, cocoa, block, dispatch, io-surface, …)
+#   - Windows binding crates (windows, winapi, …)
+#   - Any graphics API (metal, wgpu, ash, d3d12, …)
+#   - Native codec linkage (ffmpeg-sys*, libavformat) — that belongs in a
+#     shell-side adapter, because an Apple-enabled FFmpeg build would otherwise
+#     pull Apple frameworks in transitively.
+#
+# Enforced by ci/check-portable.sh, which must FAIL on a deliberate violation.
