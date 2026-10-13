@@ -13,7 +13,7 @@ import CoreVideo
 import Metal
 
 /// A looping video file decoded to Metal textures.
-public final class VideoSource: @unchecked Sendable {
+public final class VideoSource: FrameSource, @unchecked Sendable {
     // Confined to the main thread in practice (AVPlayer requires it); the
     // unchecked conformance exists so the render thread can read cached state.
     /// The file this source plays. Lets the engine keep a source alive across a

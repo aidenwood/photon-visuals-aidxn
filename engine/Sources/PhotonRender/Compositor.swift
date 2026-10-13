@@ -81,15 +81,33 @@ public struct LayerUniform {
     public var kind: Int32                // 0 = solid, 1 = gradient, 2 = rings, 3 = video
     /// Index into the bound texture array, or -1 for a procedural layer.
     public var texSlot: Int32
+    /// Fraction of the texture that is visible picture.
+    ///
+    /// `(1, 1)` for ordinary video. Block-compressed textures are padded up to
+    /// whole 4x4 blocks with the width rounded to 16, so a DXV clip that is not
+    /// a multiple of 16 wide would otherwise show a strip of undefined blocks
+    /// down its right-hand edge.
+    public var texScale: SIMD2<Float>
+    /// Bit 0: the texture's RGB is premultiplied by its alpha.
+    public var flags: Int32
+    /// Keeps the struct's stride equal to the shader's. Not read by anything.
+    private var reserved: Int32 = 0
+
+    /// Bit 0 of `flags`. DXV stores premultiplied RGB and the sampler has to
+    /// divide it back out; skip it and every Resolume DXT5 clip renders dark.
+    public static let flagPremultiplied: Int32 = 1
 
     public init(tint: SIMD4<Float>, offsetScale: SIMD4<Float>,
-                opacity: Float, blend: BlendMode, kind: Int32, texSlot: Int32 = -1) {
+                opacity: Float, blend: BlendMode, kind: Int32, texSlot: Int32 = -1,
+                texScale: SIMD2<Float> = SIMD2(1, 1), flags: Int32 = 0) {
         self.tint = tint
         self.offsetScale = offsetScale
         self.opacity = opacity
         self.blend = blend.rawValue
         self.kind = kind
         self.texSlot = texSlot
+        self.texScale = texScale
+        self.flags = flags
     }
 }
 
@@ -274,7 +292,13 @@ public final class Compositor: @unchecked Sendable {
         int    blend;
         int    kind;
         int    texSlot;
+        float2 texScale;
+        int    flags;
+        int    reserved;
     };
+
+    // Bit 0 of LayerUniform.flags. Mirrors LayerUniform.flagPremultiplied.
+    constant int FLAG_PREMULTIPLIED = 1;
 
     vertex float4 fullscreen_vertex(uint id [[vertex_id]]) {
         float2 p = float2((id << 1) & 2, id & 2);
@@ -361,7 +385,29 @@ public final class Compositor: @unchecked Sendable {
                 constexpr sampler vs(filter::linear, address::clamp_to_edge);
                 float2 p = (uv - 0.5) / max(L.offsetScale.zw, float2(0.001))
                            + 0.5 - L.offsetScale.xy;
-                float4 c = texs[L.texSlot].sample(vs, float2(p.x, 1.0 - p.y));
+                // texScale crops a block-compressed texture back to its visible
+                // picture; it is (1,1) for everything else.
+                //
+                // The clamp is load-bearing, not belt and braces: with linear
+                // filtering the last visible column is interpolated against
+                // whatever sits beyond it, so an un-clamped crop still bleeds
+                // the padding in — measurably, 40% of it at the right edge.
+                // address::clamp_to_edge cannot help, because the edge of the
+                // TEXTURE is not the edge of the picture.
+                float2 texels = float2(texs[L.texSlot].get_width(),
+                                       texs[L.texSlot].get_height());
+                float2 half_texel = 0.5 / max(texels, float2(1.0));
+                float2 uvp = clamp(float2(p.x, 1.0 - p.y) * L.texScale,
+                                   half_texel, L.texScale - half_texel);
+                float4 c = texs[L.texSlot].sample(vs, uvp);
+                if (L.flags & FLAG_PREMULTIPLIED) {
+                    // DXV stores RGB multiplied by alpha. Undo it exactly as
+                    // photon_core::codec::dxv::unpremultiply does, including
+                    // passing colour through untouched where alpha is zero —
+                    // dividing there would turn transparent pixels into
+                    // whatever the encoder happened to leave behind.
+                    c.rgb = (c.a > 0.0) ? min(c.rgb / c.a, 1.0) : c.rgb;
+                }
                 float inside = (p.x > 0.0 && p.x < 1.0 && p.y > 0.0 && p.y < 1.0) ? 1.0 : 0.0;
                 s = float4(c.rgb, c.a * L.opacity * inside);
             } else {

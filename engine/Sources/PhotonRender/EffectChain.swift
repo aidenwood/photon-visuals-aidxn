@@ -1099,10 +1099,15 @@ public final class EffectChain {
         case 33: {  // luma key — amount is the cut, param the softness
             float4 c = src.sample(sm, uv);
             float l = lumaPerceptual(c.rgb);       // perceptual: a key is an eye judgement
-            // Cut spans slightly below zero so that at amount 0 even a pure
-            // black pixel is fully opaque — a true identity, not "almost".
-            float lo = a * 1.05 - 0.05;
             float soft = mix(0.002, 0.5, p);
+            // The WHOLE ramp has to clear zero at amount 0, not just its lower
+            // edge. A fixed -0.05 offset left the ramp's top at +0.45 for a
+            // wide softness, so a parked key still dimmed every shadow in the
+            // frame — alpha 0.219 across 23% of a test image. Scaling the
+            // offset by the softness makes `lo + soft == 0` exactly when
+            // amount is 0, so every non-negative luma is fully opaque and the
+            // identity is real at any softness rather than only a narrow one.
+            float lo = a * (1.0 + soft) - soft;
             return float4(c.rgb, c.a * smoothstep(lo, lo + soft, l));
         }
         case 34: {  // chroma key — amount is the tolerance, param the key hue

@@ -30,6 +30,26 @@ var checks = 0
     }
 }
 
+/// Runs a block of checks that needs a live `PhotonEngine`, and **fails loudly
+/// if it cannot be built** rather than skipping in silence.
+///
+/// Four sections used to read `if let dev = ..., let eng = ... { }` with no
+/// `else`. If the engine could not be constructed, every check inside simply
+/// did not happen — and the suite still printed "N/N passed" and exited 0.
+/// A gate that reports success for work it never did is worse than no gate,
+/// because it is trusted. Found by an adversarial audit, not by anything
+/// failing, which is exactly the point.
+@MainActor func engineSection(_ name: String,
+                              _ body: (MTLDevice, PhotonEngine) -> Void) {
+    guard let dev = MTLCreateSystemDefaultDevice(),
+          let eng = PhotonEngine(device: dev) else {
+        check("\(name) section ran", false,
+              "no Metal device or engine — these checks did NOT run")
+        return
+    }
+    body(dev, eng)
+}
+
 guard let device = MTLCreateSystemDefaultDevice(),
       let compositor = Compositor(device: device),
       let stage = OutputStage(device: device) else {
@@ -366,7 +386,7 @@ do {
 
     // Setting a topology on the engine must never leave the output with
     // nothing to draw — blackout stays an explicit operator action.
-    if let dev = MTLCreateSystemDefaultDevice(), let eng = PhotonEngine(device: dev) {
+    engineSection("topology") { dev, eng in
         eng.topology = OutputTopology(name: "empty", screens: [])
         check("an empty mapping falls back rather than going black",
               !eng.slices.isEmpty, "slices=\(eng.slices.count)")
@@ -640,6 +660,41 @@ do {
         return px.map(Float.init)
     }
 
+    /// Every texel of a texture, in one read.
+    ///
+    /// The checks below used to sample a 4×4 grid — **16 texels of 4096, 0.4%**
+    /// — and that sparsity hid a real defect: `lumaKey` is not an identity at
+    /// its neutral amount, driving alpha to 0.219 across 23% of the image,
+    /// while every one of the 16 sampled points happened to be unaffected.
+    /// Whole-image delta 0.845, sampled delta 0.00000. A guard that inspects
+    /// 0.4% of the evidence is a guard that passes things.
+    ///
+    /// One `getBytes` for the whole surface costs less than 16 separate reads,
+    /// so there was never a reason for the grid.
+    func readAll(_ tex: MTLTexture) -> [Float] {
+        let readable: MTLTexture
+        if tex.storageMode == .shared {
+            readable = tex
+        } else {
+            guard let cb = compositor.makeCommandBuffer(),
+                  let blit = cb.makeBlitCommandEncoder() else { return [.nan] }
+            blit.copy(from: tex, sourceSlice: 0, sourceLevel: 0,
+                      sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
+                      sourceSize: MTLSize(width: SIZE, height: SIZE, depth: 1),
+                      to: stage, destinationSlice: 0, destinationLevel: 0,
+                      destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0))
+            blit.endEncoding()
+            cb.commit(); cb.waitUntilCompleted()
+            readable = stage
+        }
+        var px = [Float16](repeating: 0, count: SIZE * SIZE * 4)
+        px.withUnsafeMutableBytes { b in
+            readable.getBytes(b.baseAddress!, bytesPerRow: SIZE * 8,
+                              from: MTLRegionMake2D(0, 0, SIZE, SIZE), mipmapLevel: 0)
+        }
+        return px.map(Float.init)
+    }
+
     // `beat` is non-zero on purpose: strobe gates on musical phase, and at beat 0
     // it is legitimately open, which would look like a missing implementation.
     func applyOne(_ kind: EffectKind) -> MTLTexture {
@@ -650,17 +705,11 @@ do {
         return out
     }
 
+    let probeAll = readAll(probe)
     var deadKinds: [String] = []
     for kind in EffectKind.allCases {
-        let out = applyOne(kind)
-
-        var changed = false
-        for gy in stride(from: SIZE / 8, to: SIZE, by: SIZE / 4) {
-            for gx in stride(from: SIZE / 8, to: SIZE, by: SIZE / 4) {
-                let a = rgba(probe, gx, gy), b = rgba(out, gx, gy)
-                for ch in 0..<4 where abs(a[ch] - b[ch]) > 0.002 { changed = true }
-            }
-        }
+        let out = readAll(applyOne(kind))
+        let changed = zip(probeAll, out).contains { abs($0 - $1) > 0.002 }
         if !changed { deadKinds.append(kind.name) }
     }
     check("every effect kind is implemented in the shader", deadKinds.isEmpty,
@@ -691,21 +740,10 @@ do {
         let out = chain.apply([Effect(kind: kind, amount: amount, param: param)],
                               to: probe, in: cb, time: 0.37, beat: beat)
         cb.commit(); cb.waitUntilCompleted()
-        var grid: [Float] = []
-        for gy in stride(from: SIZE / 8, to: SIZE, by: SIZE / 4) {
-            for gx in stride(from: SIZE / 8, to: SIZE, by: SIZE / 4) {
-                grid.append(contentsOf: rgba(out, gx, gy))
-            }
-        }
-        return grid
+        return readAll(out)
     }
 
-    var probeBaseline: [Float] = []
-    for gy in stride(from: SIZE / 8, to: SIZE, by: SIZE / 4) {
-        for gx in stride(from: SIZE / 8, to: SIZE, by: SIZE / 4) {
-            probeBaseline.append(contentsOf: rgba(probe, gx, gy))
-        }
-    }
+    let probeBaseline = readAll(probe)
 
     var notNeutral: [String] = []
     for kind in EffectKind.allCases {
@@ -792,23 +830,11 @@ do {
         let cb = compositor.makeCommandBuffer()!
         let out = chain.apply([fx], to: probe, in: cb, time: 0.37, beat: 2.0)
         cb.commit(); cb.waitUntilCompleted()
-        var grid: [Float] = []
-        for gy in stride(from: SIZE / 8, to: SIZE, by: SIZE / 4) {
-            for gx in stride(from: SIZE / 8, to: SIZE, by: SIZE / 4) {
-                grid.append(contentsOf: rgba(out, gx, gy))
-            }
-        }
-        return grid
+        return readAll(out)
     }
 
     let dry: [Float] = {
-        var grid: [Float] = []
-        for gy in stride(from: SIZE / 8, to: SIZE, by: SIZE / 4) {
-            for gx in stride(from: SIZE / 8, to: SIZE, by: SIZE / 4) {
-                grid.append(contentsOf: rgba(probe, gx, gy))
-            }
-        }
-        return grid
+        return readAll(probe)
     }()
 
     // Invert at full strength, so wet is unmistakably different from dry and a
@@ -895,6 +921,47 @@ do {
     check("blend mode raw values are contiguous from zero",
           modes.map(\.rawValue) == Array(Int32(0)...Int32(10)),
           "got \(modes.map(\.rawValue))")
+
+    // Read the Rust enum and compare against it, rather than against a number
+    // typed in here.
+    //
+    // The first version of this guard asserted `count == 11` and "contiguous
+    // 0...10" — both of which are a hardcoded copy of the Swift side, so it
+    // would have passed happily while `photon-core` grew a twelfth mode. That
+    // is precisely the defect it exists to catch, which an adversarial audit
+    // pointed out and was right about. The only non-circular check is to go
+    // and look at the other language.
+    do {
+        let coreFile = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()   // PhotonVerify
+            .deletingLastPathComponent()   // Sources
+            .deletingLastPathComponent()   // engine
+            .deletingLastPathComponent()   // repo root
+            .appendingPathComponent("photon-core/src/doc/mod.rs")
+
+        if let rust = try? String(contentsOf: coreFile, encoding: .utf8),
+           let body = rust.range(of: "pub enum BlendMode {").map({ r in
+               rust[r.upperBound...].prefix(while: { $0 != "}" })
+           }) {
+            // Variant lines only: bare identifiers, no attributes or comments.
+            let rustVariants = body
+                .split(separator: "\n")
+                .map { $0.trimmingCharacters(in: .whitespaces) }
+                .filter { !$0.isEmpty && !$0.hasPrefix("//") && !$0.hasPrefix("#") }
+                .map { $0.hasSuffix(",") ? String($0.dropLast()) : $0 }
+                .filter { $0.allSatisfy(\.isLetter) }
+
+            // "Hard Light" in Swift is `HardLight` in Rust.
+            let swiftNames = modes.map { $0.name.replacingOccurrences(of: " ", with: "") }
+
+            check("blend modes match photon-core, variant for variant",
+                  rustVariants == swiftNames,
+                  "rust \(rustVariants) vs swift \(swiftNames)")
+        } else {
+            check("photon-core's BlendMode is readable for comparison", false,
+                  "could not read \(coreFile.path) — the cross-language check did NOT run")
+        }
+    }
 
     // Mask must gate on the source's BRIGHTNESS — the black-to-white axis a
     // greyscale matte is painted on — not multiply channel by channel.
@@ -1148,7 +1215,7 @@ do {
 
 // 18. Live inputs — must FAIL SOFT. No device is an ordinary Tuesday.
 print("\nlive inputs:")
-if let dev = MTLCreateSystemDefaultDevice(), let eng = PhotonEngine(device: dev) {
+engineSection("live inputs") { dev, eng in
     // Neither of these may throw, hang, or crash regardless of what hardware
     // is present or what permissions have been granted.
     let midiOK = eng.startMidi()
@@ -1247,7 +1314,7 @@ do {
 
 // 20. Engine + deck integration.
 print("\nengine + deck:")
-if let dev = MTLCreateSystemDefaultDevice(), let eng = PhotonEngine(device: dev) {
+engineSection("engine + deck") { dev, eng in
     let urls = ((try? FileManager.default.contentsOfDirectory(
         atPath: URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent().deletingLastPathComponent()
@@ -1491,7 +1558,7 @@ do {
           list.current == nil && list.next?.name == "Open")
 
     // Engine integration: autopilot fires THROUGH the deck, so it is quantised.
-    if let dev = MTLCreateSystemDefaultDevice(), let eng = PhotonEngine(device: dev) {
+    engineSection("autopilot through the deck") { dev, eng in
         let url = URL(fileURLWithPath: "/tmp/x.mp4")
         var d = Deck(layers: 2, columns: 4)
         for l in 0..<2 { for c in 0..<4 { d[l, c] = Cell(clipURL: url, name: "c") } }
@@ -1802,6 +1869,172 @@ do {
     let cleared = m.sample()
     check("a reset meter is unavailable again rather than stale",
           cleared.cpuMilliseconds == nil && cleared.frameIntervalP50 == nil)
+}
+
+// DXV — the block-compressed path.
+//
+// Three things can only be checked on the GPU, and all three are invisible in
+// a unit test because they fail by looking *plausible*:
+//   1. the blocks really are sampled as BC, not as bytes;
+//   2. premultiplied RGB is divided back out, or the clip plays dark;
+//   3. the padding is cropped, or the right-hand edge shows undefined blocks.
+print("\nDXV block textures:")
+do {
+    /// Uploads hand-built blocks exactly as `BlockVideoSource` does.
+    @MainActor func blockTexture(_ bytes: [UInt8], format: MTLPixelFormat,
+                                 width: Int, height: Int) -> MTLTexture? {
+        let d = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: format, width: width, height: height, mipmapped: false)
+        d.usage = .shaderRead
+        d.storageMode = device.hasUnifiedMemory ? .shared : .managed
+        guard let t = device.makeTexture(descriptor: d) else { return nil }
+        let bytesPerBlock = format == .bc1_rgba ? 8 : 16
+        t.replace(region: MTLRegionMake2D(0, 0, width, height), mipmapLevel: 0,
+                  withBytes: bytes, bytesPerRow: (width / 4) * bytesPerBlock)
+        return t
+    }
+
+    /// One BC1 block: every texel is colour 0.
+    func bc1Block(_ rgb565: UInt16) -> [UInt8] {
+        [UInt8(rgb565 & 0xFF), UInt8(rgb565 >> 8), 0, 0, 0, 0, 0, 0]
+    }
+
+    /// One BC3 block: flat alpha, every texel colour 0.
+    func bc3Block(alpha: UInt8, rgb565: UInt16) -> [UInt8] {
+        [alpha, alpha, 0, 0, 0, 0, 0, 0,
+         UInt8(rgb565 & 0xFF), UInt8(rgb565 >> 8), 0, 0, 0, 0, 0, 0]
+    }
+
+    @MainActor func renderTextured(_ layer: LayerUniform, _ tex: MTLTexture) -> [UInt8] {
+        let td = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .bgra8Unorm_srgb, width: SIZE, height: SIZE, mipmapped: false)
+        td.usage = [.renderTarget, .shaderRead]
+        td.storageMode = .shared
+        guard let output = device.makeTexture(descriptor: td),
+              let cb = compositor.makeCommandBuffer() else { return [] }
+        let work = compositor.composite(into: cb, layers: [layer], time: 0,
+                                        width: SIZE, height: SIZE, textures: [tex])
+        let rp = MTLRenderPassDescriptor()
+        rp.colorAttachments[0].texture = output
+        rp.colorAttachments[0].loadAction = .clear
+        rp.colorAttachments[0].storeAction = .store
+        rp.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
+        if let work {
+            stage.encode(into: cb, descriptor: rp, source: work,
+                         slices: [OutputStage.identitySlice()])
+        }
+        cb.commit()
+        cb.waitUntilCompleted()
+        var p = [UInt8](repeating: 0, count: SIZE * SIZE * 4)
+        p.withUnsafeMutableBytes { buf in
+            output.getBytes(buf.baseAddress!, bytesPerRow: SIZE * 4,
+                            from: MTLRegionMake2D(0, 0, SIZE, SIZE), mipmapLevel: 0)
+        }
+        return p
+    }
+
+    func videoLayer(texScale: SIMD2<Float> = SIMD2(1, 1), flags: Int32 = 0) -> LayerUniform {
+        LayerUniform(tint: .init(1, 1, 1, 1), offsetScale: .init(0, 0, 1, 1),
+                     opacity: 1, blend: .over, kind: 3, texSlot: 0,
+                     texScale: texScale, flags: flags)
+    }
+
+    check("this GPU can sample BC textures at all", device.supportsBCTextureCompression)
+
+    // 1. BC1 blocks sample as colour, not as bytes. 0xF800 is pure red in 565.
+    if let tex = blockTexture(Array(repeating: bc1Block(0xF800), count: 4).flatMap { $0 },
+                              format: .bc1_rgba, width: 16, height: 4) {
+        let c = px(renderTextured(videoLayer(), tex), SIZE / 2, SIZE / 2)
+        check("BC1 blocks upload and sample as colour", c.r > 200 && c.g < 40 && c.b < 40,
+              "centre BGR=\(c)")
+    } else {
+        check("BC1 texture allocates", false)
+    }
+
+    // 2. Premultiplied RGB. The block holds mid-grey at half alpha, which IS
+    //    white premultiplied. Undone, it composites to ~0.5 coverage of white
+    //    (~188 after the sRGB encode). Left premultiplied it lands near 139 —
+    //    the "everything renders dark" failure, which looks like a deliberate
+    //    choice rather than a bug.
+    if let tex = blockTexture(Array(repeating: bc3Block(alpha: 128, rgb565: 0x8410), count: 4)
+                                .flatMap { $0 },
+                              format: .bc3_rgba, width: 16, height: 4) {
+        let straight = px(renderTextured(videoLayer(), tex), SIZE / 2, SIZE / 2).r
+        let undone = px(renderTextured(
+            videoLayer(flags: LayerUniform.flagPremultiplied), tex), SIZE / 2, SIZE / 2).r
+        check("premultiplied DXV colour is divided back out", undone > 175,
+              "expected ~188, got \(undone)")
+        check("and it genuinely changes the picture", undone > straight + 30,
+              "premultiplied=\(straight) corrected=\(undone)")
+    } else {
+        check("BC3 texture allocates", false)
+    }
+
+    // 3. Padding. A 1366-wide DXV clip lives in a 1376-wide texture; the extra
+    //    blocks hold whatever the encoder left there. Here the right-hand half
+    //    is green and must never be sampled.
+    let split = (Array(repeating: bc1Block(0xF800), count: 4)
+                 + Array(repeating: bc1Block(0x07E0), count: 4)).flatMap { $0 }
+    if let tex = blockTexture(split, format: .bc1_rgba, width: 32, height: 4) {
+        let cropped = px(renderTextured(videoLayer(texScale: SIMD2(0.5, 1)), tex),
+                         SIZE - 2, SIZE / 2)
+        let whole = px(renderTextured(videoLayer(), tex), SIZE - 2, SIZE / 2)
+        check("texScale crops the padding away", cropped.r > 200 && cropped.g < 60,
+              "right edge BGR=\(cropped)")
+        check("and without it the padding would be on screen", whole.g > 150,
+              "right edge BGR=\(whole)")
+    } else {
+        check("split BC1 texture allocates", false)
+    }
+}
+
+// End to end, against real Resolume files. Opt-in: point
+// PHOTON_DXV_SAMPLE_DIR at a folder of clips. Without it there is nothing
+// honest to assert, so the section says so rather than passing vacuously.
+print("\nDXV playback (real files):")
+do {
+    let env = ProcessInfo.processInfo.environment["PHOTON_DXV_SAMPLE_DIR"]
+    if let dir = env.map({ URL(fileURLWithPath: $0) }) {
+    let files = (FileManager.default.enumerator(at: dir, includingPropertiesForKeys: nil)?
+        .compactMap { $0 as? URL }
+        .filter { $0.pathExtension.lowercased() == "mov" } ?? []).sorted { $0.path < $1.path }
+    check("sample folder holds clips", !files.isEmpty, dir.path)
+
+    var played: [MTLPixelFormat: Int] = [:]
+    var refused: [String] = []
+    for url in files {
+        guard let probe = probeMedia(url: url), probe.isDXV else { continue }
+        guard let source = makeFrameSource(url: url, device: device) as? BlockVideoSource else {
+            refused.append(url.lastPathComponent)
+            continue
+        }
+        // Give the decode thread a moment; it opens a file and inflates a
+        // frame that can be 8 MB of blocks.
+        var texture: MTLTexture?
+        for i in 0..<120 where texture == nil {
+            texture = source.texture(at: CACurrentMediaTime() + Double(i) * 0.004)
+            if texture == nil { usleep(10_000) }
+        }
+        if let texture {
+            played[texture.pixelFormat, default: 0] += 1
+        } else {
+            refused.append("\(url.lastPathComponent): \(source.failure ?? "no frame")")
+        }
+    }
+    let bc1 = played[.bc1_rgba] ?? 0
+    let bc3 = played[.bc3_rgba] ?? 0
+    check("DXT1 clips play", bc1 > 0, "\(bc1) files")
+    check("DXT5 clips play", bc3 > 0, "\(bc3) files")
+    check("every texture that reached the GPU is block-compressed",
+          played.keys.allSatisfy { $0 == .bc1_rgba || $0 == .bc3_rgba },
+          "formats: \(played.keys.map(String.init(describing:)).joined(separator: ", "))")
+    // Refusals are expected — YCG6/YG10 and DXV1 are not derived — but they
+    // must be refusals, not silent black layers.
+    print("  – played \(bc1 + bc3) clips; \(refused.count) refused with a reason")
+    for r in refused.prefix(4) { print("    · \(r)") }
+    } else {
+        print("  – skipped (set PHOTON_DXV_SAMPLE_DIR to a folder of DXV clips)")
+    }
 }
 
 print("\n\(checks - failures)/\(checks) checks passed")

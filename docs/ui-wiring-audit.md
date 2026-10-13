@@ -12,6 +12,24 @@ describes **what is on disk now**, not what was in the build Aiden screenshotted
 > `DEMO` badge (`macos/Sources/PhotonUI/Panels/Preview/PreviewPanel.swift:15`). **Rebuild before
 > re-testing** — several of the complaints are already fixed in the tree.
 
+> **Amended 2026-10-13, later the same day.** Clip opacity, layer blend (all 11 modes), transport
+> play/pause, BPM and tap tempo are now **LIVE** and the rows below say so; each was confirmed by
+> driving the running app, not by reading. Two changes of principle came out of that work and
+> apply to anything wired from here on:
+>
+> 1. **Blend is layer-owned.** `LayerState.blend` is the only blend the engine has, and Resolume
+>    agrees. The Clip tab's Blend row edits the host layer's blend and names it; there is no
+>    per-clip blend to store any more. Mode identity crosses the seam as the engine's
+>    `BlendMode` raw value, never as a display name — see `BlendModeOption`.
+> 2. **Continuous controls must drive the engine during the drag, not on release.** The renderer
+>    reads the acknowledged snapshot, and `ControlSnapshotRefresh` debounces that read by 80 ms by
+>    *cancelling and restarting* its timer — so a drag emitting every 16 ms starved it completely
+>    and the output only moved ~80 ms after mouse-up. Opacity controls now publish an optimistic
+>    value that `masterPlan` prefers (`WorkspaceModel+LiveControls.swift`). **Any new continuous
+>    control has to do the same**, or it will have this bug and look fine in code review.
+>
+> The counts at the end of this document have **not** been recomputed and are stale.
+
 ---
 
 ## How to read the verdicts
@@ -57,7 +75,7 @@ effects, transforms and clip-level opacity are STORED rather than LIVE.
 | Layer opacity fader | `PhotonUI/Panels/Grid/LayerControlRow.swift:23` → `LayerStrip.swift:22` | Fade that layer in the composite | Full chain to `LayerState.opacity`; compositor skips the layer when alpha ≤ 0 (`Compositor.swift:361`) | **LIVE** |
 | Layer **B** (bypass) | `LayerControlRow.swift:18`, `LayerStrip.swift:23` | Exclude layer from composite | `setLayerBypass` → `LayerState.bypassed` → excluded by `Engine.activeLayers` (`Engine.swift:361`) | **LIVE** |
 | Layer **S** (solo) | `LayerControlRow.swift:19`, `LayerStrip.swift:24` | Show only soloed layers | `setLayerSolo` → `LayerState.soloed` → `Engine.swift:362` | **LIVE** |
-| Layer blend "Normal" | `LayerControlRow.swift:22` | Reads as the layer's blend mode | A literal `Text("Normal")`. Not a menu, not bound to anything, cannot be changed | **INERT** |
+| Layer blend | `LayerControlRow.swift:24` (`CompactBlendMenu`) → `WorkspaceModel.setLayerBlendMode` | Set the layer's blend mode | Real menu of **all 11** engine modes, built from the injected `BlendModeOption` catalogue (`NativeBlendModes.all` ← `BlendMode.allCases`). `LayerSnapshot.blendModeID` → `SurfacePlan.Layer.blendModeID` → `BlendMode(rawValue:)` → `LayerState.blend`. *Observed 2026-10-13: Darken on Layer 1 composited to black.* | **LIVE** |
 | Layer name (select) | `LayerControlRow.swift:14` → `WorkspaceModel.selectLayer` (`WorkspaceModel.swift:63`) | Select layer for the inspector | Sets `selectedLayerID`, switches inspector scope | **LIVE** |
 | Clip cell (launch) | `PhotonUI/Panels/Grid/MatrixClipCell.swift:12` → `WorkspaceModel+Live.swift:17` | Launch clip on that layer | Sets `activeClips[layer]`; `masterPlan` resolves its `assetID` to a real file URL (`EngineSurface.swift:30`) and the engine opens a `VideoSource` | **LIVE** |
 | Empty clip slot | `MatrixClipCell.swift:43` | — | A `Rectangle`. No drop target, no click target | **INERT** |
@@ -69,12 +87,12 @@ effects, transforms and clip-level opacity are STORED rather than LIVE.
 
 | Control | Where it lives | What it claims to do | What it actually does | Verdict |
 |---|---|---|---|---|
-| Play / pause | `PhotonUI/Panels/Transport/TransportControls.swift:10` → `WorkspaceModel.togglePlayback` (`WorkspaceModel.swift:119`) | Start/stop playback | Sets `PreviewWorkspaceProvider.playing` (`PreviewWorkspaceProvider.swift:111`). Nothing reads it. `VideoSource` playback is driven by the display link and never pauses | **STORED** |
+| Play / pause | `TransportControls.swift:19` → `WorkspaceModel.togglePlayback` | Start/stop playback | `TransportSnapshot.isPlaying` → `SurfacePlan.playing` → `PhotonEngine.isPlaying`, which plays/pauses every source. A pause **holds the frame**; it is not a blackout. *Observed 2026-10-13: three successive captures byte-identical while paused, all different while playing.* | **LIVE** |
 | Timecode `00:00:00` | `TransportControls.swift:16` | Playhead position | Literal string | **FIXTURE** |
 | `PREVIEW` pill | `TransportControls.swift:17` | Mode indicator | Literal string | **FIXTURE** |
-| BPM readout | `TransportControls.swift:21` ← `PreviewWorkspaceProvider.swift:87` | Project tempo | Always `120`. `PhotonEngine.bpm` (`Engine.swift:295`) is never read or written by the UI | **FIXTURE** |
-| BPM field (editable) | — | — | Does not exist. The BPM is a `Text`, not a `TextField` | **INERT** (absent) |
-| Tap tempo | — | — | Does not exist anywhere in `macos/Sources` | **INERT** (absent) |
+| BPM field (editable) | `TransportControls.swift:35` → `WorkspaceModel.setBPM` | Project tempo | A real `TextField`. `TransportSnapshot.bpm` → `SurfacePlan.bpm` → `PhotonEngine.bpm`, which propagates to every BPM-synced clip in one frame. Out-of-range entries revert visibly rather than clamping | **LIVE** |
+| Timecode `00:00:00` | `TransportControls.swift:26` | Playhead position | Still a literal string. `PhotonEngine.beat` is not surfaced | **FIXTURE** |
+| Tap tempo | `TransportControls.swift:30` → `WorkspaceModel.tapTempo` | Tap a tempo in | Averages up to 4 recent taps, restarts after a 2 s gap, drops out-of-range results. *Observed 2026-10-13: 5 taps at ~0.42 s moved 120 → 141.2 BPM.* Interim only — `photon-core`'s `clock.rs` owns the real tap and this routes there once the core session is wired | **LIVE** |
 
 ### Master strip (persistent footer)
 
@@ -115,8 +133,8 @@ effects, transforms and clip-level opacity are STORED rather than LIVE.
 | **Layer** → Effects stack | `LayerInspector.swift:18` | Layer effects | **STORED** | **STORED** |
 | **Layer** → Modulation "Unbound" | `LayerInspector.swift:19-21` | Bindings | Literal text, no binding UI | **FIXTURE** |
 | **Group** tab | `InspectorPanel.swift:36` | Group inspector | `PanelEmptyView` placeholder. No groups exist in any model | **INERT** |
-| **Clip** → Opacity | `Inspector/InspectorContents.swift:14` → `WorkspaceModel.setOpacity` (`WorkspaceModel.swift:98`) | Clip opacity | Writes `PreviewWorkspaceProvider.opacities[clipID]` (`PreviewWorkspaceProvider.swift:103`). `SurfacePlan` has **no per-clip opacity field** — never reaches the engine | **STORED** |
-| **Clip** → Blend | `InspectorContents.swift:15` → `BlendModeControl.swift` → `WorkspaceModel.setBlendMode` | Clip blend mode | Writes `blendModes[clipID]` (`PreviewWorkspaceProvider.swift:109`). `engine.setBlend` exists (`ProgramMetalView.swift:145`) and is **never called** | **STORED** |
+| **Clip** → Opacity | `InspectorContents.swift:23` → `WorkspaceModel.setOpacity` | Clip opacity | `LayerSnapshot.clipOpacity` → `SurfacePlan.Layer.clipOpacity`, **multiplied** into the layer fader at `ProgramMetalView.apply` — Resolume semantics, two faders that multiply. *Observed 2026-10-13: 54% visibly dimmed the composite while the pre-composite Preview monitor stayed bright.* | **LIVE** |
+| **Clip** → Blend | `InspectorContents.swift:24` → `BlendModeControl` | Blend of the layer hosting this clip | There is no per-clip blend in the engine or in Resolume — blend is layer-owned. The row edits the **host layer's** blend and names it (`Layer 2 · Over`). A clip that is not launched has no host, and the control reads `Launch to set` instead of accepting a pick | **LIVE** (or visibly unavailable) |
 | **Clip** → Transform Position `0, 0` | `InspectorContents.swift:18` | Layer offset | `ParameterReadout` with a literal string. `LayerUniform.offsetScale` exists and is never driven | **FIXTURE** |
 | **Clip** → Transform Scale `100%` | `InspectorContents.swift:19` | Layer scale | Literal string | **FIXTURE** |
 | **Clip** → Transform Rotation `0°` | `InspectorContents.swift:20` | Layer rotation | Literal string. The compositor has **no rotation term at all** | **FIXTURE** |

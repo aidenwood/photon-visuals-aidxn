@@ -170,7 +170,7 @@ public final class PhotonEngine: @unchecked Sendable {
     }
 
     private var layerStates: [LayerState] = []
-    private var sources: [Int: VideoSource] = [:]      // layer id -> source
+    private var sources: [Int: FrameSource] = [:]      // layer id -> source
     private var heldTextures: [Int: MTLTexture] = [:]  // layer id -> last good frame
 
     private var uniforms: [LayerUniform] = []
@@ -185,6 +185,25 @@ public final class PhotonEngine: @unchecked Sendable {
     /// Frame timing. Owns every number in ``telemetry`` that is a duration or
     /// a rate; nothing else in the engine measures time for display.
     public let meter = FrameMeter()
+
+    /// Transport run state for every clip in the composition.
+    ///
+    /// A pause **holds the frame** — sources stop advancing, the compositor
+    /// keeps presenting what they last supplied, and the display link keeps
+    /// running. It is not a blackout and it is not a stall: an operator who
+    /// pauses expects the image to stay on the screen, and the output must
+    /// keep presenting at a steady cadence either way.
+    ///
+    /// Musical time is deliberately unaffected. `beat` keeps advancing so the
+    /// grid, cue list and any synced lighting stay in phase across a pause;
+    /// stopping the clock instead would make the first launch after a resume
+    /// land wherever the pause happened to end.
+    public var isPlaying: Bool = true {
+        didSet {
+            guard isPlaying != oldValue else { return }
+            for (_, src) in sources { isPlaying ? src.play() : src.pause() }
+        }
+    }
 
     /// Master opacity, applied after the composite.
     public var masterOpacity: Float = 1
@@ -255,8 +274,13 @@ public final class PhotonEngine: @unchecked Sendable {
             heldTextures[id] = nil
         }
         for st in capped where st.clipURL != nil && sources[st.id] == nil {
-            if let url = st.clipURL, let src = VideoSource(url: url, device: device) {
+            if let url = st.clipURL, let src = makeFrameSource(url: url, device: device) {
                 src.bpm = bpm
+                // A source opened while the transport is paused must not start
+                // running on its own: launching a clip into a paused
+                // composition would make pause look broken on exactly the one
+                // layer that just changed.
+                if !isPlaying { src.pause() }
                 sources[st.id] = src
             }
         }
@@ -269,8 +293,9 @@ public final class PhotonEngine: @unchecked Sendable {
         layerStates[idx].clipURL = url
         heldTextures[id] = nil
         guard let url else { sources[id] = nil; return }
-        let src = VideoSource(url: url, device: device)
+        let src = makeFrameSource(url: url, device: device)
         src?.bpm = bpm
+        if !isPlaying { src?.pause() }
         sources[id] = src
     }
 
@@ -427,6 +452,11 @@ public final class PhotonEngine: @unchecked Sendable {
 
         for (slot, st) in active.enumerated() {
             var texSlot: Int32 = -1
+            // Default to "the whole texture, straight RGB" — the block path
+            // overrides both, and getting either wrong is visible rather than
+            // subtle (garbage down one edge, or a dark picture).
+            var texScale = SIMD2<Float>(1, 1)
+            var flags: Int32 = 0
 
             if let src = sources[st.id] {
                 // nil means no new frame — hold the previous one rather than
@@ -438,6 +468,8 @@ public final class PhotonEngine: @unchecked Sendable {
                 if let held = heldTextures[st.id] {
                     boundTextures.append(held)
                     texSlot = Int32(slot)
+                    texScale = src.textureScale
+                    if src.isPremultiplied { flags |= LayerUniform.flagPremultiplied }
                 }
             }
 
@@ -458,7 +490,9 @@ public final class PhotonEngine: @unchecked Sendable {
                 opacity: blackout ? 0 : st.opacity * masterOpacity,
                 blend: st.blend,
                 kind: patternKind?.rawValue ?? (texSlot >= 0 ? 3 : Int32(slot % 3)),
-                texSlot: patternKind != nil ? -1 : texSlot))
+                texSlot: patternKind != nil ? -1 : texSlot,
+                texScale: texScale,
+                flags: flags))
         }
 
         if uniforms.isEmpty {
