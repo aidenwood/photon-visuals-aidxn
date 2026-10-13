@@ -131,8 +131,8 @@ in [`docs/frontend.md`](docs/frontend.md). Performance tests and benchmark runs 
 | [`docs/frontend.md`](docs/frontend.md) | Native frontend ownership, components and engine adapter handover | Implemented scaffold; runtime integration follows |
 | `docs/bench-fairness.md` | Rules every published performance number must obey | **not written** |
 | `docs/bench-cli.md` | CLI contract `photonbench` drives | **not written** |
-| `photon-core/src/doc/` | Authoritative Rust document model + generated schema/types | R0 deliverable; not implemented |
-| `docs/control-protocol.md` | Versioned state/command semantics; transport adapters later | R0 contract; not implemented |
+| `photon-core/src/doc/` | Authoritative Rust document model + generated schema/types | ✅ **implemented** — 882 lines, serde `deny_unknown_fields`, inside the 275-test suite |
+| [`docs/control-protocol.md`](docs/control-protocol.md) | Versioned state/command semantics; transport adapters later | ✅ **contract written, protocol implemented** — `photon-core/src/protocol.rs`, 422 lines, 10 tests. Transport **adapters** still to build |
 
 ## Agents
 
