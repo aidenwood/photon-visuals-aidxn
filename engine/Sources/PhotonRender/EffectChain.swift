@@ -275,21 +275,108 @@ public enum EffectKind: Int32, Sendable, CaseIterable {
 }
 
 /// One effect instance with its parameters.
+/// One effect instance in a chain.
+///
+/// ## Why there is a `values` array rather than two named floats
+///
+/// This was `{ amount, param }` — exactly two controls. That is enough for the
+/// 35 built-ins and for nothing beyond them: Resolume's `Stripper` has 21
+/// parameters, `Iterate` has 40+, `ParticleSystem` has 30. Two floats is not a
+/// simplification of those, it is a wall, and every effect written against the
+/// pair cements it. Widening the shape is cheap now and ruinous once sixty
+/// effects have hardcoded two floats, so it happens now.
+///
+/// `amount` and `param` remain as accessors onto `values[0]` and `values[1]`,
+/// because they are the right names for the first two controls and every
+/// existing call site is correct. Nothing had to be rewritten to gain the
+/// capacity.
+///
+/// ## Why `mix` and `blend` live here and not in each shader
+///
+/// Every one of the 116 presets in Resolume's own factory set has the shape
+/// `DryWetEffect → Effect → Mixer`. Dry/wet and a per-effect blend mode are
+/// **host infrastructure**, not something each effect implements. Photon's
+/// `amount` was doing double duty as both strength and wet/dry, which is why
+/// effects like `kaleidoscope` and `posterize` have no natural fade-in: their
+/// `amount` changes *what* they do, so it cannot also control *how much*.
+///
+/// Hoisting it here gives all 35 a real fade and a blend mode without touching
+/// any of their shader code.
 public struct Effect: Sendable {
+    /// Largest parameter count a single effect may declare.
+    ///
+    /// Sized past Resolume's worst case (`Iterate`, 40+) so the limit is not
+    /// reached by porting something that already exists. The uniform buffer is
+    /// per-pass and tiny; there is no reason to be mean here.
+    public static let maxValues = 48
+
     public var kind: EffectKind
-    /// Primary amount, 0...1. Modulatable like any other parameter.
-    public var amount: Float
-    /// Secondary control; meaning depends on the effect.
-    public var param: Float
+    /// Parameter values, indexed as the effect's own spec defines them.
+    ///
+    /// Always at least two entries, so `amount` and `param` are total.
+    public private(set) var values: [Float]
     /// Bypassed without being removed, so settings survive an A/B.
     public var enabled: Bool
+    /// Dry/wet, `0` = untouched input, `1` = the effect alone.
+    ///
+    /// Separate from `amount` on purpose — see the type note above.
+    public var mix: Float
+    /// How the wet result combines back over the dry input.
+    ///
+    /// `.over` reproduces ordinary behaviour, so this is free to ignore.
+    public var blend: BlendMode
+
+    /// Primary amount, 0...1. Modulatable like any other parameter.
+    public var amount: Float {
+        get { values[0] }
+        set { values[0] = newValue }
+    }
+
+    /// Secondary control; meaning depends on the effect. See ``EffectKind/paramLabel``.
+    public var param: Float {
+        get { values[1] }
+        set { values[1] = newValue }
+    }
 
     public init(kind: EffectKind, amount: Float = 0.5,
-                param: Float = 0.5, enabled: Bool = true) {
+                param: Float = 0.5, enabled: Bool = true,
+                mix: Float = 1, blend: BlendMode = .over) {
         self.kind = kind
-        self.amount = amount
-        self.param = param
+        self.values = [amount, param]
         self.enabled = enabled
+        self.mix = mix
+        self.blend = blend
+    }
+
+    /// An effect with an explicit parameter list.
+    ///
+    /// Padded to two and clamped to ``maxValues`` so `amount` and `param`
+    /// cannot trap, whatever a caller or a loaded document supplies. A show
+    /// file is untrusted input.
+    public init(kind: EffectKind, values: [Float], enabled: Bool = true,
+                mix: Float = 1, blend: BlendMode = .over) {
+        var v = Array(values.prefix(Self.maxValues))
+        while v.count < 2 { v.append(0.5) }
+        self.kind = kind
+        self.values = v
+        self.enabled = enabled
+        self.mix = mix
+        self.blend = blend
+    }
+
+    /// Reads a parameter beyond the first two, or `nil` if not present.
+    ///
+    /// Returns `nil` rather than a default: an effect asking for a control it
+    /// was not given is a bug in the caller, and a silent `0.5` would hide it.
+    public func value(at index: Int) -> Float? {
+        values.indices.contains(index) ? values[index] : nil
+    }
+
+    /// Sets a parameter, growing the list if needed. Ignored past ``maxValues``.
+    public mutating func setValue(_ v: Float, at index: Int) {
+        guard index < Self.maxValues else { return }
+        while values.count <= index { values.append(0.5) }
+        values[index] = v
     }
 }
 
@@ -308,7 +395,12 @@ struct EffectUniforms {
     /// Continuous musical position, so a strobe can lock to tempo rather than
     /// to wall-clock seconds — which is the entire point of having a clock.
     var beat: Float
-    var pad: Float = 0
+    /// Dry/wet. Applied by the chain, not by any effect.
+    var mix: Float
+    /// `BlendMode.rawValue` for folding the wet result over the dry input.
+    var blend: Int32
+    /// How many entries of the parameter buffer are real.
+    var valueCount: Int32
 }
 
 /// Runs effect chains into offscreen targets.
@@ -401,8 +493,17 @@ public final class EffectChain {
                 // settings. 256 is a power of two (so every binary division
                 // stays seamless), keeps 2^-15-beat precision in fp32, and
                 // pushes the worst case to once every ~2 minutes at 128 BPM.
-                beat: Float(beat.truncatingRemainder(dividingBy: 256.0)))
+                beat: Float(beat.truncatingRemainder(dividingBy: 256.0)),
+                mix: fx.mix,
+                blend: fx.blend.rawValue,
+                valueCount: Int32(fx.values.count))
             enc.setFragmentBytes(&u, length: MemoryLayout<EffectUniforms>.stride, index: 0)
+            // The full parameter list rides in its own buffer so adding a
+            // control to an effect never changes the uniform layout — the
+            // exact class of silent ABI drift that cost a crash today.
+            var vals = fx.values
+            enc.setFragmentBytes(&vals, length: MemoryLayout<Float>.stride * vals.count,
+                                 index: 1)
             enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
             enc.endEncoding()
 
@@ -417,7 +518,12 @@ public final class EffectChain {
         return read
     }
 
-    static let shaderSource = """
+    /// The blend maths are spliced in from ``BlendMSL`` rather than written
+    /// here, so the compositor and the effect chain cannot disagree about what
+    /// "Multiply" means. A second copy is how the Swift/Rust enum drifted.
+    static var shaderSource: String { shaderHead + BlendMSL.source + shaderBody }
+
+    private static let shaderHead = """
     #include <metal_stdlib>
     using namespace metal;
 
@@ -431,13 +537,19 @@ public final class EffectChain {
         float  time;        // 12
         float2 resolution;  // 16
         float  beat;        // 24
-        float  pad;         // 28
+        float  mix;         // 28
+        int    blend;       // 32
+        int    valueCount;  // 36
     };
 
     vertex float4 effect_vertex(uint id [[vertex_id]]) {
         float2 p = float2((id << 1) & 2, id & 2);
         return float4(p * 2.0 - 1.0, 0.0, 1.0);
     }
+
+    """
+
+    private static let shaderBody = """
 
     constant float TAU = 6.283185307;
     constant float GOLDEN_ANGLE = 2.39996323;
@@ -550,13 +662,20 @@ public final class EffectChain {
     // They are asserted against Swift by `every effect kind is implemented` in
     // PhotonVerify — a kind that falls through to `default` is a bug, not a
     // placeholder, because the browser offers it to the operator regardless.
-    fragment float4 effect_fragment(float4 pos [[position]],
-                                    constant EffectUniforms &u [[buffer(0)]],
-                                    texture2d<float> src [[texture(0)]])
+    // The effect itself. Returns the WET result only — dry/wet and the
+    // per-effect blend are applied by `effect_fragment` below, so no effect
+    // has to implement them and none can implement them inconsistently.
+    //
+    // `vals` carries the full parameter list. `u.amount` and `u.param` are
+    // `vals[0]` and `vals[1]`; effects needing more read `vals[n]` after
+    // checking `u.valueCount`.
+    static float4 effect_wet(constant EffectUniforms &u,
+                             texture2d<float> src,
+                             sampler sm,
+                             float2 uv,
+                             float2 texel,
+                             constant float *vals)
     {
-        constexpr sampler sm(filter::linear, address::clamp_to_edge);
-        float2 uv = pos.xy / u.resolution;
-        float2 texel = 1.0 / u.resolution;
         float  a = u.amount;
         float  p = u.param;
         // Aspect, for every effect with a notion of "round" or "the same
@@ -1008,6 +1127,36 @@ public final class EffectChain {
         default:
             return src.sample(sm, uv);
         }
+    }
+
+    // Dry/wet and the per-effect blend, applied once for every effect.
+    //
+    // This is the `DryWetEffect -> Effect -> Mixer` shape every Resolume preset
+    // has. Doing it here rather than inside each effect is the difference
+    // between 35 effects that each fade their own way and 35 that fade the
+    // same way — and it gives a real fade to the ones whose `amount` changes
+    // WHAT they do rather than how much, which could never fade themselves.
+    //
+    // At `mix == 1` and `blend == over` this is a bit-exact passthrough of the
+    // wet result, so nothing that worked before changes.
+    fragment float4 effect_fragment(float4 pos [[position]],
+                                    constant EffectUniforms &u [[buffer(0)]],
+                                    constant float *vals [[buffer(1)]],
+                                    texture2d<float> src [[texture(0)]])
+    {
+        constexpr sampler sm(filter::linear, address::clamp_to_edge);
+        float2 uv = pos.xy / u.resolution;
+        float2 texel = 1.0 / u.resolution;
+
+        float4 wet = effect_wet(u, src, sm, uv, texel, vals);
+        if (u.mix >= 1.0 && u.blend == 0) { return wet; }
+
+        float4 dry = src.sample(sm, uv);
+        float3 combined = blend_rgb(u.blend, dry.rgb, wet.rgb);
+        // Alpha is crossfaded, never blended: a key's alpha is its entire
+        // output, and running it through a colour blend would make a luma key
+        // at half wet mean something nobody could predict.
+        return float4(mix(dry.rgb, combined, u.mix), mix(dry.a, wet.a, u.mix));
     }
     """
 }

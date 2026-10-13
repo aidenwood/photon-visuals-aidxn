@@ -258,7 +258,12 @@ public final class Compositor: @unchecked Sendable {
 
     // MARK: - MSL
 
-    static let shaderSource = """
+    /// `blend_rgb` is spliced in from ``BlendMSL`` rather than written here, so
+    /// the compositor and the effect chain share one definition of what each
+    /// mode means. Two copies is how the Swift enum drifted from the Rust one.
+    static var shaderSource: String { shaderHead + BlendMSL.source + shaderTail }
+
+    private static let shaderHead = """
     #include <metal_stdlib>
     using namespace metal;
 
@@ -331,21 +336,9 @@ public final class Compositor: @unchecked Sendable {
         return float4(c, a * L.opacity);
     }
 
-    static float3 blend_rgb(int mode, float3 dst, float3 src) {
-        switch (mode) {
-            case 1:  return dst + src;                                  // add
-            case 2:  return dst * src;                                  // multiply
-            case 3:  return dst + src - dst * src;                      // screen
-            case 4:  return abs(dst - src);                             // difference
-            case 5:  return dst * src;                                  // mask (luma of src gates dst)
-            case 6:  return select(2.0*dst*src, 1.0-2.0*(1.0-dst)*(1.0-src), dst > 0.5); // overlay
-            case 7:  return select(2.0*dst*src, 1.0-2.0*(1.0-dst)*(1.0-src), src > 0.5); // hard light
-            case 8:  return max(dst - src, 0.0);                        // subtract
-            case 9:  return max(dst, src);                              // lighten
-            case 10: return min(dst, src);                              // darken
-            default: return src;                                        // over
-        }
-    }
+    """
+
+    private static let shaderTail = """
 
     fragment float4 composite_fragment(float4 pos [[position]],
                                        constant LayerUniform *layers [[buffer(0)]],

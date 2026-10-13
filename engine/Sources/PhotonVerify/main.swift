@@ -781,6 +781,99 @@ do {
     }
     check("no effect produces NaN or infinity at the ends of its range",
           nonFinite.isEmpty, "non-finite output from: \(nonFinite.joined(separator: ", "))")
+
+    // Dry/wet and per-effect blend, which the chain applies for every effect
+    // rather than each effect implementing its own. Resolume wraps every one
+    // of its effects the same way (`DryWetEffect -> Effect -> Mixer`), and the
+    // reason to do it host-side is exactly that it then cannot vary: an
+    // operator who learns what the mix knob does on one effect knows what it
+    // does on all 35.
+    func probeMixed(_ fx: Effect) -> [Float] {
+        let cb = compositor.makeCommandBuffer()!
+        let out = chain.apply([fx], to: probe, in: cb, time: 0.37, beat: 2.0)
+        cb.commit(); cb.waitUntilCompleted()
+        var grid: [Float] = []
+        for gy in stride(from: SIZE / 8, to: SIZE, by: SIZE / 4) {
+            for gx in stride(from: SIZE / 8, to: SIZE, by: SIZE / 4) {
+                grid.append(contentsOf: rgba(out, gx, gy))
+            }
+        }
+        return grid
+    }
+
+    let dry: [Float] = {
+        var grid: [Float] = []
+        for gy in stride(from: SIZE / 8, to: SIZE, by: SIZE / 4) {
+            for gx in stride(from: SIZE / 8, to: SIZE, by: SIZE / 4) {
+                grid.append(contentsOf: rgba(probe, gx, gy))
+            }
+        }
+        return grid
+    }()
+
+    // Invert at full strength, so wet is unmistakably different from dry and a
+    // mix that silently did nothing could not pass by coincidence.
+    let fullyWet = probeMixed(Effect(kind: .invert, amount: 1, mix: 1))
+    let fullyDry = probeMixed(Effect(kind: .invert, amount: 1, mix: 0))
+    let halfWet  = probeMixed(Effect(kind: .invert, amount: 1, mix: 0.5))
+
+    check("mix = 0 returns the dry input untouched",
+          zip(fullyDry, dry).allSatisfy { abs($0 - $1) < 0.002 },
+          "a fully dry effect changed the picture")
+
+    check("mix = 1 is the effect alone",
+          zip(fullyWet, dry).contains { abs($0 - $1) > 0.01 },
+          "a fully wet invert did not change the picture")
+
+    // The midpoint must actually sit between the two. An implementation that
+    // treated mix as a switch would pass both checks above and fail this one.
+    check("mix = 0.5 lands between dry and wet",
+          zip(halfWet, zip(dry, fullyWet)).allSatisfy { h, pair in
+              let (d, w) = pair
+              return abs(h - (d + w) * 0.5) < 0.01
+          },
+          "half mix is not the midpoint — mix is behaving as a switch")
+
+    // Per-effect blend. Add over a known wet result gives dry + wet.
+    //
+    // Colour channels only. Alpha is crossfaded by `mix`, never run through
+    // the blend — a key's alpha IS its output, and adding two opaque alphas
+    // would give 2. That is the documented behaviour, so the check has to
+    // honour it rather than assert the whole RGBA sums.
+    let added = probeMixed(Effect(kind: .invert, amount: 1, mix: 1, blend: .add))
+    let rgbIdx = added.indices.filter { $0 % 4 != 3 }
+    check("per-effect blend mode folds the wet result over the dry",
+          rgbIdx.allSatisfy { i in abs(added[i] - (dry[i] + fullyWet[i])) < 0.02 },
+          "blend .add did not sum the dry and wet colour channels")
+
+    check("blend leaves alpha crossfaded rather than blended",
+          added.indices.filter { $0 % 4 == 3 }
+              .allSatisfy { abs(added[$0] - fullyWet[$0]) < 0.002 },
+          "alpha was run through the colour blend")
+
+    // The parameter list. These are pure value-type checks, but they guard the
+    // thing that makes a 21-parameter effect possible at all.
+    check("an effect always has at least two values",
+          Effect(kind: .invert, values: []).values.count == 2,
+          "short value lists must pad, or amount/param would trap")
+
+    check("a value list is clamped to the maximum",
+          Effect(kind: .invert,
+                 values: Array(repeating: 0.5, count: Effect.maxValues + 20))
+              .values.count == Effect.maxValues,
+          "an over-long list must clamp — a show file is untrusted input")
+
+    check("values beyond the list read as nil rather than a default",
+          Effect(kind: .invert, amount: 1, param: 1).value(at: 7) == nil,
+          "a missing parameter must be nil, not a silent 0.5")
+
+    var grown = Effect(kind: .invert)
+    grown.setValue(0.25, at: 5)
+    check("setting a high parameter grows the list",
+          grown.values.count == 6 && grown.value(at: 5) == 0.25)
+
+    check("amount and param alias the first two values",
+          grown.amount == grown.values[0] && grown.param == grown.values[1])
 }
 
 
