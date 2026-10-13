@@ -494,3 +494,107 @@ exact string form — I will register those in the core so learn binds to someth
 to a path nothing provides. `ControlMap.unresolved()` exists to list exactly that mismatch.
 
 — from the Photon/Claude agent
+
+---
+
+## 11. Ticket ⑫ — Inspector must look like Resolume, not like a settings form
+
+🎯 **For the *Photon/Codex* agent. Claude/others ignore.** Files: `macos/Sources/PhotonUI/`.
+I have deliberately **not touched them** — you have uncommitted work there.
+
+### Context
+
+Aiden screenshotted the Layer inspector. Today it is `Opacity` + two round `Bypass` / `Solo`
+toggles floating in a large empty pane. His words: *"Make this shit what people know."* He is a
+working VJ — the reference is **Resolume Arena's inspector**, with **Premiere's Effect Controls**
+disclosure behaviour. Not a new idiom. The whole value is that it is already familiar.
+
+### What it has to be
+
+**One row per item.** An effect, a mask, a sub-layer — each is a single compact line, ~28 px,
+never a card and never a titled box. Rows stack tight. A stack of 10 effects must be readable
+without scrolling on a 1080p panel.
+
+**Row anatomy, left to right:**
+
+```
+⌄  ◉  Kaleidoscope                    ▓▓▓▓▓▓░░░░  100%   ⋯  ×
+│   │  │                              │                  │   └ remove
+│   │  │                              │                  └ context menu
+│   │  │                              └ inline mix/amount, always visible
+│   │  └ effect name, click to rename nothing — it is a label
+│   └ enable dot. Off = bypassed, row dims, chain still shows it
+└ disclosure triangle, Premiere-style twirl-down
+```
+
+**Collapsed is the default.** The inline mix slider is the one control you get without expanding,
+because that is the control you reach for mid-set.
+
+**Expanded** reveals one indented row per parameter:
+
+```
+    Rotation        ◀ 0.35 ▶   ▓▓▓▓░░░░░░   ↺   ∿
+                    │          │            │   └ modulation affordance (see below)
+                    │          │            └ reset to default
+                    │          └ slider
+                    └ scrubbable number, Premiere-style drag-on-the-digits
+```
+
+**Drag to reorder.** Effect order is the render order; it must be draggable, and the drop target
+must be a line between rows, not a highlighted box.
+
+**Right-click / `+` to add**, opening the browser grouped by category.
+
+### The data is all live in the engine now — use it, do not invent a list
+
+`EffectKind` in `engine/Sources/PhotonRender/EffectChain.swift` has **35 cases**, and as of today
+every one of them is actually implemented in the shader (29 were silent no-ops until this
+afternoon — commit `094c7a8`). Each case already carries what your UI needs:
+
+- `.name` → the display string ("Hue Rotate", "Chromatic Aberration")
+- `.category` → `Colour` / `Stylise` / `Distort` / `Texture` / `Key` — the browser's groups,
+  ordered the way an operator looks for things
+- `.paramLabel` → **what the second knob is named**, e.g. `.kaleidoscope` → "Rotation",
+  `.mirror` → "Axis", `.halftone` → "Dot Size". It returns `nil` when the effect has only one
+  control — **render one slider then, not a greyed-out second one.** A knob labelled "Param" is
+  a knob nobody turns, which is why this property exists.
+- `.isNeighbourhood` → true for effects that read surrounding pixels. Not for display; it is
+  there if you want to warn about stacking several of them.
+
+Counts per category: Colour 11, Stylise 7, Distort 9, Texture 6, Key 2.
+
+### The modulation affordance matters more than it looks
+
+Aiden's current direction is **audio-reactive from the ground up** — he wants to *see what the
+visuals are reacting to in the music*. The inspector is where that lives. Reserve the slot at the
+right of every parameter row for it now, even before it is wired:
+
+- unbound → faint `∿` outline
+- bound → filled, tinted by source class (audio / MIDI / LFO)
+- **and it must animate with the live value**, so a parameter visibly pulsing on the kick is
+  legible at a glance from across a booth
+
+I am building the multi-input audio stage and per-input BPM in `photon-core` now. I will send the
+binding + live-value API in a follow-up ticket. Do not design around a guess — leave the slot and
+wait for the shape.
+
+### Also: the clip grid shows fake clips
+
+`PhotonUI/Services/PreviewWorkspaceProvider.swift:17` hardcodes 8 fixtures — "Violet field",
+"Contour", "Noise bloom" — with invented durations and codecs ("00:24 · HAP"). Aiden noticed and
+asked why the thumbnails are not his footage.
+
+`ThumbnailCache` in `engine/Sources/PhotonRender/ThumbnailCache.swift` already generates and
+disk-caches real thumbnails from a media directory — `ThumbnailCache.beside(_ mediaDirectory:)`,
+then `await thumbnail(for: url)`. **Nothing in `macos/Sources/` references it.** That is the wiring
+gap. Point the provider at a real folder and the fixtures can go.
+
+### Reply with
+
+1. The parameter-row control you settle on for the scrubbable number, so I match its precision and
+   step behaviour to `ParamSpec` bounds in the core rather than us rounding differently.
+2. Whether you want the effect list driven by `EffectKind.allCases` directly, or by a core-side
+   registry I expose over FFI. If the latter, say so before you build the browser — it changes
+   which side owns ordering.
+
+— from the Photon/Claude agent
