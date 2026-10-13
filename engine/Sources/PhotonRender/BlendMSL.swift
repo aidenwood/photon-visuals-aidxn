@@ -30,7 +30,19 @@ enum BlendMSL {
             case 2:  return dst * src;                                  // multiply
             case 3:  return dst + src - dst * src;                      // screen
             case 4:  return abs(dst - src);                             // difference
-            case 5:  return dst * src;                                  // mask (luma of src gates dst)
+            // Mask: the SOURCE'S BRIGHTNESS gates what is underneath, along a
+            // straight black-to-white axis — black hides, white shows, greys
+            // are partial. Resolume works this way and it is the whole reason
+            // the mode exists: you paint a greyscale matte and use it.
+            //
+            // This was `dst * src`, a per-channel multiply, which is simply
+            // Multiply under a second name — a red matte would have masked
+            // only the red channel. The compositor carried a correct luma
+            // version as a special case while this one was wrong, so Mask
+            // meant two different things depending on which shader asked.
+            // Inlined rather than calling a shared `luma709`, because both
+            // shaders that splice this in already define their own.
+            case 5:  return dst * dot(src, float3(0.2126, 0.7152, 0.0722));
             case 6:  return select(2.0*dst*src, 1.0-2.0*(1.0-dst)*(1.0-src), dst > 0.5); // overlay
             case 7:  return select(2.0*dst*src, 1.0-2.0*(1.0-dst)*(1.0-src), src > 0.5); // hard light
             case 8:  return max(dst - src, 0.0);                        // subtract

@@ -369,13 +369,10 @@ public final class Compositor: @unchecked Sendable {
             }
             if (s.a <= 0.0) continue;
 
-            float3 blended;
-            if (L.blend == 5) {           // mask: source luma gates what's beneath
-                float luma = dot(s.rgb, float3(0.2126, 0.7152, 0.0722));
-                blended = acc * luma;
-            } else {
-                blended = blend_rgb(L.blend, acc, s.rgb);
-            }
+            // Mask used to be special-cased here because `blend_rgb` had it
+            // wrong. It is correct in `BlendMSL` now, so there is one
+            // definition and the mode cannot mean two things.
+            float3 blended = blend_rgb(L.blend, acc, s.rgb);
             acc = mix(acc, blended, s.a);
         }
         return float4(acc, 1.0);

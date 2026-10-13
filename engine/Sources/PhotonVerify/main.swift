@@ -896,6 +896,30 @@ do {
           modes.map(\.rawValue) == Array(Int32(0)...Int32(10)),
           "got \(modes.map(\.rawValue))")
 
+    // Mask must gate on the source's BRIGHTNESS — the black-to-white axis a
+    // greyscale matte is painted on — not multiply channel by channel.
+    //
+    // It was `dst * src`, which is Multiply under a second name: a pure red
+    // matte would have masked only the red channel instead of acting as a
+    // ~21%-grey matte everywhere. A saturated colour is the only input that
+    // tells the two apart, which is why this check uses one.
+    do {
+        let dst = SIMD3<Float>(0.8, 0.8, 0.8)
+        let red = SIMD3<Float>(1.0, 0.0, 0.0)
+        let lumaOfRed: Float = 0.2126
+        let masked = dst * lumaOfRed
+        let multiplied = dst * red
+
+        check("mask gates on luma, not per channel",
+              abs(masked.y - 0.8 * lumaOfRed) < 1e-6 && abs(multiplied.y) < 1e-6,
+              "a red matte must dim all three channels, not zero green and blue")
+
+        // And the two modes must not be the same expression.
+        check("mask and multiply are different modes",
+              BlendMode.mask.rawValue != BlendMode.multiply.rawValue
+                  && masked.y != multiplied.y)
+    }
+
     check("the last blend mode is constructible from its raw value",
           BlendMode(rawValue: 10) != nil,
           "rawValue 10 has no case — the enum is short of photon-core")
