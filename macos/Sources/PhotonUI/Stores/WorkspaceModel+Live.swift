@@ -47,9 +47,20 @@ extension WorkspaceModel {
     }
 
     public func setLayerOpacity(_ value: Double, layerID: String) {
+        // Published before the command is even sent: this is the value the
+        // render surface reads, and a busked fader has to land this turn.
+        let request = beginLiveControl(.layerOpacity(layerID))
+        liveLayerOpacity[layerID] = value
         commands.send(.setLayerOpacity(layerID: layerID, value: value)) { [weak self] in
-            self?.controlRefresh.schedule(.layers) { [weak self] in self?.reloadLayers() }
-        } failed: { [weak self] issue in self?.layers.report(issue) }
+            self?.controlRefresh.schedule(.layers) { [weak self] in
+                self?.endLiveControl(.layerOpacity(layerID), request, after: self?.reloadLayers()) {
+                    $0.liveLayerOpacity[layerID] = nil
+                }
+            }
+        } failed: { [weak self] issue in
+            self?.endLiveControl(.layerOpacity(layerID), request) { $0.liveLayerOpacity[layerID] = nil }
+            self?.layers.report(issue)
+        }
     }
 
     public func toggleLayerBypass(_ layer: LayerSnapshot) {
@@ -60,7 +71,20 @@ extension WorkspaceModel {
         liveCommand(.setLayerSolo(layerID: layer.id, value: !layer.solo))
     }
 
-    public func setMasterOpacity(_ value: Double) { masterCommand(.setMasterOpacity(value)) }
+    public func setMasterOpacity(_ value: Double) {
+        let request = beginLiveControl(.masterOpacity)
+        liveMasterOpacity = value
+        commands.send(.setMasterOpacity(value)) { [weak self] in
+            self?.controlRefresh.schedule(.master) { [weak self] in
+                self?.endLiveControl(.masterOpacity, request, after: self?.reloadMaster()) {
+                    $0.liveMasterOpacity = nil
+                }
+            }
+        } failed: { [weak self] issue in
+            self?.endLiveControl(.masterOpacity, request) { $0.liveMasterOpacity = nil }
+            self?.master.report(issue)
+        }
+    }
     public func toggleBlackout() {
         let target = !isBlackedOut
         requestedBlackout = target

@@ -9,6 +9,10 @@ struct LiveFader: View {
     @State private var draft: Double
     @State private var editing = false
     @State private var pending: Task<Void, Never>?
+    /// Set only while this view is writing an acknowledged value back into
+    /// `draft`. Without it that write looks identical to an operator edit and
+    /// gets echoed straight back to the provider.
+    @State private var adopting = false
 
     init(value: Double, label: String, change: @escaping (Double) -> Void) {
         self.value = value; self.label = label; self.change = change
@@ -25,19 +29,32 @@ struct LiveFader: View {
             Text(draft.formatted(.percent.precision(.fractionLength(0))))
                 .font(.system(size: 10)).monospacedDigit().frame(width: 35, alignment: .trailing)
         }
+        // Not gated on `editing`. A keyboard arrow press and a VoiceOver value
+        // change both move `draft` without ever calling `onEditingChanged`, so
+        // gating here meant those two input paths silently reached nothing —
+        // the fader animated and the output did not move.
         .onChange(of: draft) { _, _ in
-            guard editing, pending == nil else { return }
+            if adopting { adopting = false; return }
+            guard pending == nil else { return }
             pending = Task {
                 do { try await Task.sleep(for: .milliseconds(16)) } catch { return }
                 change(draft)
                 pending = nil
             }
         }
-        .onChange(of: value) { _, updated in if !editing { draft = updated } }
+        .onChange(of: value) { _, updated in
+            guard !editing, updated != draft else { return }
+            adopting = true
+            draft = updated
+        }
         .onDisappear {
+            // A coalesced update still in flight is a real edit that has not
+            // landed yet. Cancelling it without flushing loses the last value
+            // of a keyboard edit, which never sets `editing` at all.
+            let unflushed = pending != nil
             pending?.cancel()
             pending = nil
-            if editing { change(draft) }
+            if editing || unflushed { change(draft) }
         }
     }
 

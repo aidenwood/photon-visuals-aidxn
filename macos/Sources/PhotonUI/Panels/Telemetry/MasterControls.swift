@@ -13,7 +13,7 @@ struct MasterControls: View {
             .foregroundStyle(model.performanceLocked ? PhotonTheme.warning : PhotonTheme.muted)
             Rectangle().fill(PhotonTheme.border).frame(width: 1, height: 16)
             Text("Master").font(.system(size: 10)).foregroundStyle(PhotonTheme.muted)
-            LiveFader(value: model.master.value?.opacity ?? 1, label: "Master opacity", change: model.setMasterOpacity)
+            LiveFader(value: model.resolvedMasterOpacity, label: "Master opacity", change: model.setMasterOpacity)
                 .frame(width: 145)
             .disabled(model.master.value == nil)
             Button { model.toggleBlackout() } label: {

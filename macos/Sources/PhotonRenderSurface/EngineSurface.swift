@@ -23,8 +23,17 @@ struct SurfacePlan: Equatable {
     struct Layer: Equatable {
         var name: String
         var url: URL?
+        /// The layer's master fader.
         var opacity: Double
-        var blendMode: String
+        /// The launched clip's own fader. Kept separate from `opacity` and
+        /// multiplied into it at the engine, because they are two controls in
+        /// the inspector and the operator must be able to move either one
+        /// without the other's value being lost.
+        var clipOpacity: Double = 1
+        /// The engine's `BlendMode` raw value. An id rather than a name: a
+        /// name needs a translation table, and the table drifted from the enum
+        /// once already.
+        var blendModeID: Int32
         var bypassed: Bool
         var soloed: Bool
         var effects: [Effect] = []
@@ -33,6 +42,10 @@ struct SurfacePlan: Equatable {
     var layers: [Layer] = []
     var masterOpacity: Double = 1
     var blackout: Bool = false
+    /// Transport. `false` pauses every source; the composite keeps presenting
+    /// the held frame rather than going black, because a pause is not a cut.
+    var playing: Bool = true
+    var bpm: Double = 120
 }
 
 /// Only a real file on disk can be played. A fixture's asset ID is a bare name,
@@ -55,8 +68,13 @@ private func mediaURL(_ assetID: String) -> URL? {
         return SurfacePlan.Layer(
             name: layer.title,
             url: url,
-            opacity: layer.opacity,
-            blendMode: layer.blendMode,
+            // Resolved, not raw. A fader being dragged publishes its value on
+            // the model immediately; the acknowledged snapshot catches up
+            // ~80 ms later. Reading the snapshot alone is what made every
+            // fader commit only on release.
+            opacity: model.resolvedLayerOpacity(layer),
+            clipOpacity: model.resolvedClipOpacity(layer),
+            blendModeID: layer.blendModeID,
             // A layer with nothing launched is excluded outright: an empty
             // layer left in the stack falls through to the engine's procedural
             // kind, which would read as content the operator never triggered.
@@ -65,10 +83,16 @@ private func mediaURL(_ assetID: String) -> URL? {
             effects: surfaceEffects(model.renderChain(layerID: layer.id, activeClipID: layer.activeClipID))
         )
     }
+    // Transport belongs to the composite. Until the first snapshot lands the
+    // engine keeps running: a monitor that starts frozen because metadata is
+    // still in flight looks exactly like a decode failure.
+    let transport = model.transport.value
     return SurfacePlan(
         layers: layers,
-        masterOpacity: model.master.value?.opacity ?? 1,
-        blackout: model.isBlackedOut
+        masterOpacity: model.resolvedMasterOpacity,
+        blackout: model.isBlackedOut,
+        playing: transport?.isPlaying ?? true,
+        bpm: transport?.bpm ?? 120
     )
 }
 
@@ -86,11 +110,17 @@ private func mediaURL(_ assetID: String) -> URL? {
     // Pre-composite: there is nothing underneath, so blending is meaningless.
     // The clip's own chain still runs — it belongs to the source, not the
     // composite, so the monitor must show what the operator just added.
+    // Pre-composite also means pre-transport: this monitor exists to show what
+    // a source *is* before it is committed, so it keeps running while the
+    // composition is paused — the same rule that keeps it off master and
+    // blackout. Tempo still follows the project so a BPM-synced clip previews
+    // at the speed it will play at.
     return SurfacePlan(layers: [SurfacePlan.Layer(
-        name: snapshot.clip.title, url: url, opacity: 1, blendMode: "Normal",
+        name: snapshot.clip.title, url: url, opacity: 1,
+        blendModeID: BlendModeOption.defaultID,
         bypassed: url == nil, soloed: false,
         effects: surfaceEffects(model.renderEffects[.clip(snapshot.clip.id)] ?? [])
-    )])
+    )], playing: true, bpm: model.transport.value?.bpm ?? 120)
 }
 
 /// SwiftUI wrapper around the engine's Metal view.

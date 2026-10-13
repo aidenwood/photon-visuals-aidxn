@@ -8,8 +8,15 @@ struct LayerInspector: View {
             if let layer = snapshot.layers.first(where: { $0.id == model.selectedLayerID }) {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 1) {
-                        InspectorSection(layer.title, detail: layer.bypass ? "Bypassed" : "Video", expanded: true) {
-                            OpacityControl(value: layer.opacity) { model.setLayerOpacity($0, layerID: layer.id) }
+                        InspectorSection(layer.title, detail: layer.bypass ? "Bypassed" : model.blendModeOptions.name(for: layer.blendModeID), expanded: true) {
+                            OpacityControl(value: model.resolvedLayerOpacity(layer)) { model.setLayerOpacity($0, layerID: layer.id) }
+                            // The layer's own blend — `LayerState.blend`. The
+                            // Clip tab's Blend row edits this same value for
+                            // whichever layer the clip is playing on; there is
+                            // one blend per layer and this is it.
+                            BlendModeControl(options: model.blendModeOptions, value: layer.blendModeID) {
+                                model.setLayerBlendMode($0, layerID: layer.id)
+                            }
                             HStack(spacing: 1) {
                                 layerToggle("Bypass", active: layer.bypass) { model.toggleLayerBypass(layer) }
                                 layerToggle("Solo", active: layer.solo) { model.toggleLayerSolo(layer) }

@@ -18,8 +18,11 @@ struct LayerStrip: View {
                 LayerControlRow(
                     layer: layer,
                     selected: model.selectedLayerID == layer.id,
+                    liveOpacity: model.resolvedLayerOpacity(layer),
+                    blendModeOptions: model.blendModeOptions,
                     select: { model.selectLayer(layer.id) },
                     opacity: { model.setLayerOpacity($0, layerID: layer.id) },
+                    blend: { model.setLayerBlendMode($0, layerID: layer.id) },
                     bypass: { model.toggleLayerBypass(layer) },
                     solo: { model.toggleLayerSolo(layer) }
                 )

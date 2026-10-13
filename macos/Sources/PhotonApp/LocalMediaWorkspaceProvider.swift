@@ -13,7 +13,8 @@ actor LocalMediaWorkspaceProvider: WorkspaceProvider {
         let catalog = catalog
         let task = Task {
             try await PreviewWorkspaceProvider(latency: .zero, clips: catalog.clips(), deckTitle: "Local media",
-                effectDefinitions: NativeEffectDefinitions.all)
+                effectDefinitions: NativeEffectDefinitions.all,
+                blendModeOptions: NativeBlendModes.all)
         }
         loading = task
         do { return try await task.value }

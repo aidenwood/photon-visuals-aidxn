@@ -19,7 +19,11 @@ extension PreviewWorkspaceProvider {
                 id: id, title: "Layer \(id.split(separator: "-").last ?? "")", opacity: layerOpacities[id] ?? 1,
                 bypass: bypassedLayers.contains(id), solo: soloLayers.contains(id),
                 activeClipID: activeClips[id],
-                blendMode: activeClips[id].flatMap { blendModes[$0] } ?? "Normal",
+                // The clip's own fader, carried beside the layer's rather than
+                // folded into it: the inspector shows them as two controls, so
+                // the snapshot has to keep them as two values.
+                clipOpacity: activeClips[id].flatMap { opacities[$0] } ?? 1,
+                blendModeID: layerBlendModes[id] ?? BlendModeOption.defaultID,
                 slots: (0..<columnCount).map { column in
                     let clip = deck == "afterlight" ? instances[Self.instanceID(layer: id, column: column)] : nil
                     return ClipSlotSnapshot(id: "\(deck)-\(id)-\(column)", column: column, clip: clip)
@@ -58,6 +62,16 @@ extension PreviewWorkspaceProvider {
             try requireLayer(id)
             guard value.isFinite, (0...1).contains(value) else { throw invalidLiveAction() }
             layerOpacities[id] = value
+        case let .setLayerBlendMode(id, value):
+            try requireLayer(id)
+            // A mode the renderer never published would be dropped silently at
+            // the seam and composite as Over, with the menu still showing the
+            // name the operator picked. Refuse it here, visibly, instead.
+            guard value == BlendModeOption.defaultID
+                    || blendModeOptions.contains(where: { $0.id == value }) else {
+                throw PanelIssue(title: "Change rejected", message: "This blend mode is unavailable.")
+            }
+            layerBlendModes[id] = value
         case let .setLayerBypass(id, value):
             try requireLayer(id)
             if value { bypassedLayers.insert(id) } else { bypassedLayers.remove(id) }

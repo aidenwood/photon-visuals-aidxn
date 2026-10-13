@@ -2,8 +2,11 @@
 // Implementations must honor cancellation and keep decode/IO off the main actor.
 public enum WorkspaceAction: Sendable {
     case setOpacity(clipID: String, value: Double)
-    case setBlendMode(clipID: String, value: String)
+    /// Blend is layer-owned, matching `LayerState.blend`. `value` is the
+    /// engine's `BlendMode` raw value, never a display name.
+    case setLayerBlendMode(layerID: String, value: Int32)
     case setPlaying(Bool)
+    case setBPM(Double)
     case triggerClip(clipID: String, layerID: String)
     case triggerColumn(column: Int, deckID: String?)
     case setLayerOpacity(layerID: String, value: Double)

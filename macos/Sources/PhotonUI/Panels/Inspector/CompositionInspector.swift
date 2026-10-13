@@ -8,7 +8,7 @@ struct CompositionInspector: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 1) {
                     InspectorSection("Composition", detail: "Master", expanded: true) {
-                        OpacityControl(value: snapshot.opacity, commit: model.setMasterOpacity)
+                        OpacityControl(value: model.resolvedMasterOpacity, commit: model.setMasterOpacity)
                     }
                     InspectorSection("Output", detail: "1920 × 1080") {
                         ParameterReadout(label: "Canvas", value: "1920 × 1080")

@@ -89,7 +89,7 @@
 use std::collections::BTreeMap;
 
 use crate::doc;
-use crate::doc::{Curve, LfoShape, ModSource, Rational};
+use crate::doc::{Curve, Id, LfoShape, ModSource, Rational};
 use thiserror::Error;
 
 // ── identities ──────────────────────────────────────────────────────────────
@@ -638,6 +638,27 @@ impl Polarity {
     }
 }
 
+/// One frequency band the analyser has to compute, and the slot it writes to.
+///
+/// Produced by interning a [`ModSource::AudioBand`]. The shell asks the engine
+/// what to measure rather than being told a fixed three-band split, so a filter
+/// bank is only ever run for bands something is actually bound to.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BandRequest {
+    /// Which [`crate::doc::AudioInput`] to measure. `None` is a pre-v2 binding
+    /// that named no input; the shell resolves it against
+    /// [`AudioStage::default_input`](crate::doc::AudioStage::default_input).
+    pub input: Option<Id>,
+    /// Which [`crate::doc::AudioBandDef`] on that input, when one was named.
+    pub band: Option<Id>,
+    /// Low edge, Hz.
+    pub low_hz: f64,
+    /// High edge, Hz.
+    pub high_hz: f64,
+    /// Where the measured level is written with [`ModulationEngine::set_input`].
+    pub slot: InputSlot,
+}
+
 /// Envelope stage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EnvStage {
@@ -1000,6 +1021,145 @@ fn apply_curve(curve: Curve, x: f64) -> f64 {
     }
 }
 
+// ── introspection: what is reacting to what ─────────────────────────────────
+
+/// What a compiled source **is**, kept so the UI can say so.
+///
+/// The compiled [`Modulator`] is deliberately lossy — it is the form the frame
+/// loop wants, and by the time an audio band has become a `Follower { slot }`
+/// there is no way back to "20–250 Hz on the booth feed". This runs alongside
+/// it, written once at setup, read only by the UI.
+///
+/// It exists because of a specific thing Aiden asked for: he wants to *see*
+/// what the visuals are reacting to in the music. A meter that cannot name its
+/// source is a wiggling bar, and the operator still has to open the mapping to
+/// find out which one it is.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SourceView {
+    /// An audio band envelope. The identity fields resolve through
+    /// [`AudioStage::resolve_band`](crate::doc::AudioStage::resolve_band) —
+    /// they are carried verbatim rather than resolved here, because the
+    /// document can be edited after a binding is compiled and the UI must show
+    /// the *current* band, not the one that existed at load.
+    AudioBand {
+        /// Which input, or `None` for the stage default.
+        input: Option<Id>,
+        /// Which named band, or `None` for the ad-hoc range.
+        band: Option<Id>,
+        /// Low edge, Hz.
+        low_hz: f64,
+        /// High edge, Hz.
+        high_hz: f64,
+        /// The slot the measured level arrives in, so a UI can show the band's
+        /// raw level next to the envelope the binding made of it.
+        slot: InputSlot,
+    },
+    /// An oscillator locked to musical time.
+    BeatLfo {
+        /// Waveform.
+        shape: LfoShape,
+        /// Period in beats.
+        beats: f64,
+    },
+    /// A MIDI continuous controller.
+    MidiCc {
+        /// Channel, 0–15.
+        channel: u8,
+        /// Controller number, 0–127.
+        cc: u8,
+    },
+    /// An OSC address.
+    Osc {
+        /// The address pattern.
+        address: String,
+    },
+    /// A clip-launch envelope.
+    Envelope,
+    /// A hand-set constant.
+    Manual,
+}
+
+impl SourceView {
+    /// Broad class, for colouring a meter or an affordance.
+    ///
+    /// Four classes and not five: an envelope is grouped with the clock because
+    /// both are the *show* driving itself rather than something outside it, and
+    /// an operator scanning an inspector is asking "is this reacting to the
+    /// music, to my hands, or to itself".
+    #[must_use]
+    pub const fn class(&self) -> SourceClass {
+        match self {
+            Self::AudioBand { .. } => SourceClass::Audio,
+            Self::BeatLfo { .. } | Self::Envelope => SourceClass::Clock,
+            Self::MidiCc { .. } | Self::Osc { .. } => SourceClass::Control,
+            Self::Manual => SourceClass::Manual,
+        }
+    }
+}
+
+/// Broad class of a modulation source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceClass {
+    /// Driven by sound.
+    Audio,
+    /// Driven by musical time — a beat LFO or a launch envelope.
+    Clock,
+    /// Driven by an external controller — MIDI or OSC.
+    Control,
+    /// Parked by hand.
+    Manual,
+}
+
+/// One binding, everything about it, and what it is doing **right now**.
+///
+/// Built on demand from the last [`ModulationEngine::evaluate`]; nothing here
+/// costs the frame loop anything. The three live numbers are deliberately
+/// distinct, because conflating them is what makes a modulation UI unreadable:
+///
+/// | Field | What it is | What it is for |
+/// |---|---|---|
+/// | [`Self::signal`] | the source's own output, before this binding touches it | the **meter** — a kick band's level is the same whatever it drives |
+/// | [`Self::position`] | this binding's contribution, after invert, curve, depth and offset | the **send** — how much of the sweep *this* binding is asking for |
+/// | [`Self::value`] | the parameter after every binding on it has been summed | the **knob** — where the control actually sits |
+///
+/// A parameter with three bindings has three different `position`s and one
+/// shared `value`, which is exactly the thing an operator cannot work out by
+/// looking at the output.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BindingView<'a> {
+    /// Index in [`ModulationEngine::bindings`] — stable until a binding is
+    /// added or removed, and the handle a UI uses to re-read one row.
+    pub index: usize,
+    /// The parameter being driven.
+    pub param: ParamId,
+    /// Its readable path, e.g. `layer.3.opacity`.
+    pub target: &'a str,
+    /// The source slot.
+    pub modulator: ModulatorId,
+    /// What that source is.
+    pub source: &'a SourceView,
+    /// The source's declared signal range.
+    pub polarity: Polarity,
+    /// Scale applied to the shaped signal.
+    pub depth: f64,
+    /// Added after scaling.
+    pub offset: f64,
+    /// Response shape.
+    pub curve: Curve,
+    /// Whether the signal is inverted before the curve.
+    pub invert: bool,
+    /// The source's raw signal from the last frame.
+    pub signal: f64,
+    /// This binding's contribution in normalised sweep space, last frame.
+    ///
+    /// Not clamped — the stack is clamped once, after summing, so a single
+    /// binding genuinely can ask for more than the parameter can give, and
+    /// hiding that would make an over-driven mapping invisible.
+    pub position: f64,
+    /// The parameter's final value last frame, after every binding on it.
+    pub value: f64,
+}
+
 // ── engine ──────────────────────────────────────────────────────────────────
 
 /// Time handed to the engine once per frame.
@@ -1036,6 +1196,9 @@ impl FrameTime {
 pub struct ModulationEngine {
     params: ParameterRegistry,
     modulators: Vec<Modulator>,
+    /// Parallel to `modulators`, one entry each. Written at setup, read only by
+    /// [`Self::bindings`] — the frame loop never touches it.
+    descriptors: Vec<SourceView>,
     /// Sorted by `param`, insertion order preserved within each parameter.
     /// That ordering **is** the stacking rule; see the module docs.
     bindings: Vec<Compiled>,
@@ -1049,9 +1212,10 @@ pub struct ModulationEngine {
 
     midi: BTreeMap<(u8, u8), InputSlot>,
     osc: BTreeMap<String, InputSlot>,
-    /// `(low_hz, high_hz, slot)` — kept as a list because the analyser needs to
-    /// enumerate the bands it has to compute, not just look them up.
-    bands: Vec<(f64, f64, InputSlot)>,
+    /// Kept as a list because the analyser needs to enumerate the bands it has
+    /// to compute, not just look them up — and because the key is four fields
+    /// including the input, which a map would have to hash a float out of.
+    bands: Vec<BandRequest>,
 }
 
 impl ModulationEngine {
@@ -1116,6 +1280,34 @@ impl ModulationEngine {
     /// because they can be re-pointed independently later. Identical LFO specs
     /// produce identical signals anyway, so the only cost is a few bytes.
     pub fn add_source(&mut self, source: &ModSource) -> ModulatorId {
+        let view = match source {
+            ModSource::BeatLfo { shape, beats, .. } => SourceView::BeatLfo {
+                shape: *shape,
+                beats: *beats,
+            },
+            ModSource::Envelope { .. } => SourceView::Envelope,
+            ModSource::AudioBand {
+                input,
+                band,
+                low_hz,
+                high_hz,
+                ..
+            } => SourceView::AudioBand {
+                input: *input,
+                band: *band,
+                low_hz: *low_hz,
+                high_hz: *high_hz,
+                // Filled in below, once the slot is known.
+                slot: InputSlot(0),
+            },
+            ModSource::MidiCc { channel, cc } => SourceView::MidiCc {
+                channel: *channel,
+                cc: *cc,
+            },
+            ModSource::Osc { address } => SourceView::Osc {
+                address: address.clone(),
+            },
+        };
         let m = match source {
             ModSource::BeatLfo {
                 shape,
@@ -1147,12 +1339,14 @@ impl ModulationEngine {
                 level: 0.0,
             },
             ModSource::AudioBand {
+                input,
+                band,
                 low_hz,
                 high_hz,
                 attack_ms,
                 release_ms,
             } => {
-                let slot = self.intern_band(*low_hz, *high_hz);
+                let slot = self.intern_band(*input, *band, *low_hz, *high_hz);
                 Modulator::Follower {
                     slot,
                     attack_s: ms(*attack_ms),
@@ -1167,6 +1361,28 @@ impl ModulationEngine {
                 slot: self.intern_osc(address),
             },
         };
+        // The audio view's slot is only known after interning, so patch it
+        // here rather than duplicating the intern call.
+        let view = match (view, &m) {
+            (
+                SourceView::AudioBand {
+                    input,
+                    band,
+                    low_hz,
+                    high_hz,
+                    ..
+                },
+                Modulator::Follower { slot, .. },
+            ) => SourceView::AudioBand {
+                input,
+                band,
+                low_hz,
+                high_hz,
+                slot: *slot,
+            },
+            (view, _) => view,
+        };
+        self.descriptors.push(view);
         self.push_modulator(m)
     }
 
@@ -1178,6 +1394,7 @@ impl ModulationEngine {
     /// inversion and stacking path as everything else instead of being a
     /// special case the rest of the engine has to know about.
     pub fn add_manual(&mut self, value: f64) -> ModulatorId {
+        self.descriptors.push(SourceView::Manual);
         self.push_modulator(Modulator::Manual {
             value: if value.is_finite() { value } else { 0.0 },
         })
@@ -1242,20 +1459,49 @@ impl ModulationEngine {
         slot
     }
 
-    fn intern_band(&mut self, low_hz: f64, high_hz: f64) -> InputSlot {
-        // Bit-exact matching: two bands share an analyser slot only if they
-        // were specified identically. Fuzzy matching would quietly merge
-        // 20–120 Hz with 20–121 Hz and lose one of them.
-        if let Some(&(_, _, slot)) = self
-            .bands
-            .iter()
-            .find(|(l, h, _)| l.to_bits() == low_hz.to_bits() && h.to_bits() == high_hz.to_bits())
-        {
-            return slot;
+    fn intern_band(
+        &mut self,
+        input: Option<Id>,
+        band: Option<Id>,
+        low_hz: f64,
+        high_hz: f64,
+    ) -> InputSlot {
+        if let Some(existing) = self.find_band(input, band, low_hz, high_hz) {
+            return existing.slot;
         }
         let slot = self.intern_input();
-        self.bands.push((low_hz, high_hz, slot));
+        self.bands.push(BandRequest {
+            input,
+            band,
+            low_hz,
+            high_hz,
+            slot,
+        });
         slot
+    }
+
+    /// Finds an already-interned request matching all four keys.
+    ///
+    /// **The input is part of the key.** 20–250 Hz on the booth feed and
+    /// 20–250 Hz on the room mic are two measurements of two different signals,
+    /// and collapsing them into one slot would make the room mic drive the
+    /// booth's bindings — silently, because the levels are plausible.
+    ///
+    /// Frequencies match bit-exactly, as before: fuzzy matching would quietly
+    /// merge 20–120 Hz with 20–121 Hz and lose one of them.
+    fn find_band(
+        &self,
+        input: Option<Id>,
+        band: Option<Id>,
+        low_hz: f64,
+        high_hz: f64,
+    ) -> Option<&BandRequest> {
+        self.bands.iter().find(|b| {
+            b.input == input
+                && b.band == band
+                && b.low_hz.to_bits() == low_hz.to_bits()
+                && b.high_hz.to_bits() == high_hz.to_bits()
+        })
     }
 
     /// The slot a MIDI controller writes to, if anything mapped it.
@@ -1271,20 +1517,47 @@ impl ModulationEngine {
     }
 
     /// The slot an audio band writes to, if anything mapped it.
+    ///
+    /// All four keys, because the input is part of the identity — see
+    /// [`BandRequest`].
     #[must_use]
-    pub fn band_slot(&self, low_hz: f64, high_hz: f64) -> Option<InputSlot> {
-        self.bands
-            .iter()
-            .find(|(l, h, _)| l.to_bits() == low_hz.to_bits() && h.to_bits() == high_hz.to_bits())
-            .map(|&(_, _, slot)| slot)
+    pub fn band_slot(
+        &self,
+        input: Option<Id>,
+        band: Option<Id>,
+        low_hz: f64,
+        high_hz: f64,
+    ) -> Option<InputSlot> {
+        self.find_band(input, band, low_hz, high_hz).map(|b| b.slot)
+    }
+
+    /// Every audio band some binding asked for.
+    ///
+    /// The analyser computes exactly these and nothing else — no point running
+    /// a filter bank nobody reads. Grouping by [`BandRequest::input`] gives the
+    /// shell the per-input band set to configure each analyser with.
+    pub fn band_requests(&self) -> impl Iterator<Item = BandRequest> + '_ {
+        self.bands.iter().copied()
+    }
+
+    /// Every requested band on one input, in intern order.
+    ///
+    /// `None` asks for the bands of bindings that named no input — the pre-v2
+    /// form, which the shell resolves against
+    /// [`AudioStage::default_input`](crate::doc::AudioStage::default_input).
+    pub fn band_requests_for(&self, input: Option<Id>) -> impl Iterator<Item = BandRequest> + '_ {
+        self.bands.iter().copied().filter(move |b| b.input == input)
     }
 
     /// Every audio band some binding asked for, as `(low_hz, high_hz, slot)`.
     ///
-    /// The analyser computes exactly these and nothing else — no point running
-    /// a filter bank nobody reads.
+    /// A projection of [`Self::band_requests`] that **drops the input
+    /// identity**, kept for the single-analyser FFI path that predates the
+    /// audio stage. Two inputs asking for the same frequencies are
+    /// indistinguishable through here, so anything configuring more than one
+    /// analyser must use [`Self::band_requests`] instead.
     pub fn audio_bands(&self) -> impl Iterator<Item = (f64, f64, InputSlot)> + '_ {
-        self.bands.iter().copied()
+        self.bands.iter().map(|b| (b.low_hz, b.high_hz, b.slot))
     }
 
     /// Writes an external input. Expected in 0–1; out-of-range values saturate
@@ -1409,6 +1682,86 @@ impl ModulationEngine {
     #[must_use]
     pub fn binding_count(&self) -> usize {
         self.bindings.len()
+    }
+
+    // ── introspection ───────────────────────────────────────────────────────
+
+    /// Every binding, with its source, its target and its **live value**.
+    ///
+    /// This is the API behind "show me what the visuals are reacting to". A UI
+    /// polls it off the frame path — typically at display rate from the main
+    /// thread, against the engine's last evaluation — and gets, per row:
+    /// what drives it, what it drives, and the three distinct live numbers
+    /// documented on [`BindingView`].
+    ///
+    /// Cheap by construction: no allocation, no lookup, no string work beyond
+    /// handing out the path it already stores. [`Compiled::position`] is
+    /// recomputed from the stored signal rather than cached, so the frame loop
+    /// pays nothing at all for an inspector nobody has open.
+    ///
+    /// Ordering is by [`ParamId`], then bind order within a parameter — the
+    /// same order the stack is summed in, so a UI listing them top to bottom is
+    /// listing them in the order they actually apply.
+    pub fn bindings(&self) -> impl Iterator<Item = BindingView<'_>> + '_ {
+        (0..self.bindings.len()).filter_map(|i| self.binding(i))
+    }
+
+    /// One binding by index, as returned by [`Self::bindings`].
+    ///
+    /// Indices shift when a binding is added or removed, which is why a UI
+    /// holding one across an edit must re-read the list rather than trusting
+    /// it. There is no stable binding id in the document to hand out instead,
+    /// and inventing one here that the document cannot persist would be worse
+    /// than the honest instability.
+    #[must_use]
+    pub fn binding(&self, index: usize) -> Option<BindingView<'_>> {
+        let b = self.bindings.get(index)?;
+        let signal = self.signals.get(b.modulator.index()).copied()?;
+        Some(BindingView {
+            index,
+            param: b.param,
+            target: self.params.path(b.param)?,
+            modulator: b.modulator,
+            source: self.descriptors.get(b.modulator.index())?,
+            polarity: b.polarity,
+            depth: b.depth,
+            offset: b.offset,
+            curve: b.curve,
+            invert: b.invert,
+            signal,
+            position: b.position(signal),
+            value: self.values.get(b.param.index()).copied()?,
+        })
+    }
+
+    /// Every binding driving one parameter, in the order they are summed.
+    ///
+    /// The query an inspector row actually makes: "is this knob bound, and to
+    /// what". Returns an empty iterator for an unbound parameter, which is the
+    /// answer, not an error.
+    pub fn bindings_for(&self, param: ParamId) -> impl Iterator<Item = BindingView<'_>> + '_ {
+        // `bindings` is sorted by `param`, so this is a contiguous run — but
+        // filtering is O(n) on a list that is tens of entries long and read
+        // once per UI frame, and a binary search here would be one more place
+        // the sort invariant has to hold.
+        self.bindings().filter(move |b| b.param == param)
+    }
+
+    /// What a compiled source is, for a UI that holds a [`ModulatorId`].
+    #[must_use]
+    pub fn source_view(&self, modulator: ModulatorId) -> Option<&SourceView> {
+        self.descriptors.get(modulator.index())
+    }
+
+    /// The current value of one external input slot — a band level, a MIDI CC,
+    /// an OSC value — exactly as the shell last wrote it.
+    ///
+    /// The **meter** reading, before any envelope. Paired with
+    /// [`Self::band_requests`] this is how a UI draws a live level per audio
+    /// band without the modulation engine having to push anything at it.
+    #[must_use]
+    pub fn input(&self, slot: InputSlot) -> Option<f64> {
+        self.inputs.get(slot.index()).copied()
     }
 
     // ── the frame loop ──────────────────────────────────────────────────────
@@ -2122,13 +2475,15 @@ mod tests {
     fn an_audio_band_follows_its_input_with_attack_and_release() {
         let (mut e, p) = unit_engine("layer.1.opacity");
         let band = e.add_source(&ModSource::AudioBand {
+            input: None,
+            band: None,
             low_hz: 20.0,
             high_hz: 120.0,
             attack_ms: 10.0,
             release_ms: 500.0,
         });
         e.bind_full_sweep(p, band).expect("bind");
-        let slot = e.band_slot(20.0, 120.0).expect("band interned a slot");
+        let slot = e.band_slot(None, None, 20.0, 120.0).expect("band interned a slot");
         let frame = FrameTime::new(beat(0, 1), 1.0 / 60.0);
 
         e.set_input(slot, 1.0);
@@ -2164,13 +2519,15 @@ mod tests {
         // comes out is a perfectly ordinary number.
         let (mut e, p) = unit_engine("layer.1.opacity");
         let band = e.add_source(&ModSource::AudioBand {
+            input: None,
+            band: None,
             low_hz: 20.0,
             high_hz: 120.0,
             attack_ms: 1_000.0,
             release_ms: 1_000.0,
         });
         e.bind_full_sweep(p, band).expect("bind");
-        let slot = e.band_slot(20.0, 120.0).expect("slot");
+        let slot = e.band_slot(None, None, 20.0, 120.0).expect("slot");
         e.set_input(slot, 1.0);
 
         for bad in [0.0, -0.5, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
@@ -2201,13 +2558,15 @@ mod tests {
         // that.
         let (mut e, p) = unit_engine("layer.1.opacity");
         let band = e.add_source(&ModSource::AudioBand {
+            input: None,
+            band: None,
             low_hz: 20.0,
             high_hz: 120.0,
             attack_ms: 0.0,
             release_ms: 0.0,
         });
         e.bind_full_sweep(p, band).expect("bind");
-        let slot = e.band_slot(20.0, 120.0).expect("slot");
+        let slot = e.band_slot(None, None, 20.0, 120.0).expect("slot");
 
         e.set_input(slot, 1.0);
         e.evaluate(FrameTime::new(beat(0, 1), 1.0 / 60.0));
@@ -2288,6 +2647,8 @@ mod tests {
     fn identical_bands_share_one_analyser_slot_but_different_ones_do_not() {
         let mut e = ModulationEngine::new();
         let band = |low: f64, high: f64| ModSource::AudioBand {
+            input: None,
+            band: None,
             low_hz: low,
             high_hz: high,
             attack_ms: 5.0,
@@ -2297,9 +2658,9 @@ mod tests {
         e.add_source(&band(20.0, 120.0));
         e.add_source(&band(20.0, 121.0));
         assert_eq!(e.audio_bands().count(), 2);
-        assert_eq!(e.band_slot(20.0, 120.0), Some(InputSlot(0)));
-        assert_eq!(e.band_slot(20.0, 121.0), Some(InputSlot(1)));
-        assert_eq!(e.band_slot(30.0, 120.0), None);
+        assert_eq!(e.band_slot(None, None, 20.0, 120.0), Some(InputSlot(0)));
+        assert_eq!(e.band_slot(None, None, 20.0, 121.0), Some(InputSlot(1)));
+        assert_eq!(e.band_slot(None, None, 30.0, 120.0), None);
     }
 
     #[test]
@@ -2453,6 +2814,8 @@ mod tests {
                 release_ms: 300.0,
             });
             let band = e.add_source(&ModSource::AudioBand {
+                input: None,
+                band: None,
                 low_hz: 20.0 + i as f64,
                 high_hz: 200.0,
                 attack_ms: 10.0,
@@ -2553,5 +2916,316 @@ mod tests {
         assert_eq!(e.value(a), Some(0.1));
         assert_eq!(e.value(b), Some(0.2));
         assert_eq!(e.value(ParamId(99)), None);
+    }
+
+    // ── multiple audio inputs ───────────────────────────────────────────────
+
+    fn audio_band(input: Option<u64>, band: Option<u64>, low: f64, high: f64) -> ModSource {
+        ModSource::AudioBand {
+            input: input.map(Id::new),
+            band: band.map(Id::new),
+            low_hz: low,
+            high_hz: high,
+            attack_ms: 5.0,
+            release_ms: 180.0,
+        }
+    }
+
+    #[test]
+    fn the_same_frequencies_on_two_inputs_get_two_slots() {
+        // The defect this prevents is silent: one slot would mean the room mic
+        // writes the level the booth feed's bindings read, and both produce
+        // entirely plausible numbers.
+        let mut e = ModulationEngine::new();
+        e.add_source(&audio_band(Some(1), None, 20.0, 250.0));
+        e.add_source(&audio_band(Some(2), None, 20.0, 250.0));
+        assert_eq!(e.band_requests().count(), 2);
+        let a = e.band_slot(Some(Id::new(1)), None, 20.0, 250.0).expect("booth");
+        let b = e.band_slot(Some(Id::new(2)), None, 20.0, 250.0).expect("room");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn two_bindings_on_the_same_input_and_band_share_one_slot() {
+        // The analyser should not compute the same measurement twice because
+        // two parameters happen to follow it.
+        let mut e = ModulationEngine::new();
+        e.add_source(&audio_band(Some(1), Some(9), 20.0, 250.0));
+        e.add_source(&audio_band(Some(1), Some(9), 20.0, 250.0));
+        assert_eq!(e.band_requests().count(), 1);
+    }
+
+    #[test]
+    fn a_named_band_and_a_bare_range_on_one_input_are_different_requests() {
+        let mut e = ModulationEngine::new();
+        e.add_source(&audio_band(Some(1), Some(9), 20.0, 250.0));
+        e.add_source(&audio_band(Some(1), None, 20.0, 250.0));
+        assert_eq!(e.band_requests().count(), 2);
+    }
+
+    #[test]
+    fn a_pre_v2_binding_keeps_its_own_slot_separate_from_a_named_input() {
+        // `None` means "the stage default", which is resolved by the shell and
+        // can point anywhere. Merging it with an explicitly-named input would
+        // make the merge wrong the moment the default moves.
+        let mut e = ModulationEngine::new();
+        e.add_source(&audio_band(None, None, 20.0, 250.0));
+        e.add_source(&audio_band(Some(1), None, 20.0, 250.0));
+        assert_eq!(e.band_requests().count(), 2);
+        assert!(e.band_slot(None, None, 20.0, 250.0).is_some());
+    }
+
+    #[test]
+    fn requests_can_be_grouped_per_input_to_configure_each_analyser() {
+        let mut e = ModulationEngine::new();
+        e.add_source(&audio_band(Some(1), None, 20.0, 250.0));
+        e.add_source(&audio_band(Some(1), None, 2_000.0, 16_000.0));
+        e.add_source(&audio_band(Some(2), None, 20.0, 250.0));
+        assert_eq!(e.band_requests_for(Some(Id::new(1))).count(), 2);
+        assert_eq!(e.band_requests_for(Some(Id::new(2))).count(), 1);
+        assert_eq!(e.band_requests_for(Some(Id::new(3))).count(), 0);
+    }
+
+    #[test]
+    fn levels_written_to_one_input_do_not_move_another_inputs_parameter() {
+        // End to end: two inputs, two parameters, one silent room.
+        let mut e = ModulationEngine::new();
+        let booth_p = e.register("layer.1.opacity", ParamSpec::unit());
+        let room_p = e.register("layer.2.opacity", ParamSpec::unit());
+        let booth_m = e.add_source(&audio_band(Some(1), None, 20.0, 250.0));
+        let room_m = e.add_source(&audio_band(Some(2), None, 20.0, 250.0));
+        e.bind_full_sweep(booth_p, booth_m).expect("bind");
+        e.bind_full_sweep(room_p, room_m).expect("bind");
+
+        let booth_slot = e.band_slot(Some(Id::new(1)), None, 20.0, 250.0).expect("slot");
+        e.set_input(booth_slot, 1.0);
+        for _ in 0..600 {
+            e.evaluate(at(0, 1));
+        }
+        assert!(e.value(booth_p).expect("value") > 0.9, "the booth feed drives its own");
+        assert!(
+            e.value(room_p).expect("value") < 0.01,
+            "a silent room must stay silent"
+        );
+    }
+
+    // ── introspection: what is reacting to what ─────────────────────────────
+
+    #[test]
+    fn a_binding_reports_its_source_its_target_and_its_live_value() {
+        // The API the inspector's modulation affordance is built on.
+        let mut e = ModulationEngine::new();
+        let p = e.register("layer.3.opacity", ParamSpec::unit());
+        let m = e.add_source(&audio_band(Some(2), Some(7), 20.0, 250.0));
+        e.bind_full_sweep(p, m).expect("bind");
+
+        let slot = e.band_slot(Some(Id::new(2)), Some(Id::new(7)), 20.0, 250.0).expect("slot");
+        e.set_input(slot, 1.0);
+        for _ in 0..600 {
+            e.evaluate(at(0, 1));
+        }
+
+        let view = e.bindings().next().expect("one binding");
+        assert_eq!(view.target, "layer.3.opacity");
+        assert_eq!(view.param, p);
+        assert_eq!(view.modulator, m);
+        assert_eq!(view.source.class(), SourceClass::Audio);
+        assert_eq!(
+            *view.source,
+            SourceView::AudioBand {
+                input: Some(Id::new(2)),
+                band: Some(Id::new(7)),
+                low_hz: 20.0,
+                high_hz: 250.0,
+                slot,
+            }
+        );
+        assert!(view.signal > 0.9, "the envelope has settled on the band");
+        assert!(view.value > 0.9, "and the parameter followed it");
+    }
+
+    #[test]
+    fn the_meter_the_send_and_the_knob_are_three_different_numbers() {
+        // Conflating them is what makes a modulation UI unreadable: two
+        // bindings on one parameter share a `value` but have their own
+        // `position`, and the `signal` is the source's own level regardless.
+        let mut e = ModulationEngine::new();
+        let p = e.register("fx.1.amount", ParamSpec::unit());
+        let a = e.add_manual(0.8);
+        let b = e.add_manual(0.5);
+        e.bind(Binding {
+            param: p,
+            modulator: a,
+            depth: 0.5,
+            offset: 0.0,
+            curve: Curve::Linear,
+            invert: false,
+        })
+        .expect("bind a");
+        e.bind(Binding {
+            param: p,
+            modulator: b,
+            depth: 0.2,
+            offset: 0.0,
+            curve: Curve::Linear,
+            invert: false,
+        })
+        .expect("bind b");
+        e.evaluate(at(0, 1));
+
+        let views: Vec<_> = e.bindings_for(p).collect();
+        assert_eq!(views.len(), 2);
+        assert!((views[0].signal - 0.8).abs() < 1e-12);
+        assert!((views[0].position - 0.4).abs() < 1e-12, "0.8 x depth 0.5");
+        assert!((views[1].signal - 0.5).abs() < 1e-12);
+        assert!((views[1].position - 0.1).abs() < 1e-12, "0.5 x depth 0.2");
+        // One shared value: the sum of the two positions.
+        assert!((views[0].value - 0.5).abs() < 1e-12);
+        assert_eq!(views[0].value, views[1].value);
+    }
+
+    #[test]
+    fn an_over_driven_binding_reports_a_position_past_the_end_of_the_sweep() {
+        // Not clamped per binding, because the stack is clamped once after
+        // summing. Hiding it would make an over-driven mapping invisible to
+        // the operator trying to work out why a knob is pinned.
+        let mut e = ModulationEngine::new();
+        let p = e.register("fx.1.amount", ParamSpec::unit());
+        let m = e.add_manual(1.0);
+        e.bind(Binding {
+            param: p,
+            modulator: m,
+            depth: 3.0,
+            offset: 0.0,
+            curve: Curve::Linear,
+            invert: false,
+        })
+        .expect("bind");
+        e.evaluate(at(0, 1));
+        let v = e.binding(0).expect("binding");
+        assert!((v.position - 3.0).abs() < 1e-12);
+        assert!((v.value - 1.0).abs() < 1e-12, "but the value is clamped");
+    }
+
+    #[test]
+    fn every_source_kind_names_itself_and_its_class() {
+        let mut e = ModulationEngine::new();
+        let p = e.register("layer.1.opacity", ParamSpec::unit());
+        let sources = [
+            audio_band(Some(1), None, 20.0, 250.0),
+            ModSource::BeatLfo {
+                shape: LfoShape::Sine,
+                beats: 4.0,
+                phase: 0.0,
+            },
+            ModSource::MidiCc {
+                channel: 1,
+                cc: 74,
+            },
+            ModSource::Osc {
+                address: "/photon/a".into(),
+            },
+            ModSource::Envelope {
+                attack_ms: 5.0,
+                release_ms: 100.0,
+            },
+        ];
+        for s in &sources {
+            let m = e.add_source(s);
+            e.bind_full_sweep(p, m).expect("bind");
+        }
+        let m = e.add_manual(0.5);
+        e.bind_full_sweep(p, m).expect("bind");
+        e.evaluate(at(0, 1));
+
+        let classes: Vec<_> = e.bindings().map(|b| b.source.class()).collect();
+        assert_eq!(
+            classes,
+            [
+                SourceClass::Audio,
+                SourceClass::Clock,
+                SourceClass::Control,
+                SourceClass::Control,
+                SourceClass::Clock,
+                SourceClass::Manual,
+            ]
+        );
+        // And the identifying detail survives compilation, which is the whole
+        // reason the descriptors exist — a `Follower { slot }` cannot say
+        // "20-250 Hz on input 1".
+        let first = e.binding(0).expect("binding");
+        assert!(matches!(
+            first.source,
+            SourceView::AudioBand {
+                input: Some(_),
+                low_hz: 20.0,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn bindings_are_listed_in_the_order_they_are_summed() {
+        // A UI listing them top to bottom is listing them in the order they
+        // actually apply, so the stack reads the way it behaves.
+        let mut e = ModulationEngine::new();
+        let a = e.register("layer.1.opacity", ParamSpec::unit());
+        let b = e.register("layer.2.opacity", ParamSpec::unit());
+        let m1 = e.add_manual(0.1);
+        let m2 = e.add_manual(0.2);
+        let m3 = e.add_manual(0.3);
+        e.bind_full_sweep(b, m3).expect("bind");
+        e.bind_full_sweep(a, m1).expect("bind");
+        e.bind_full_sweep(a, m2).expect("bind");
+        e.evaluate(at(0, 1));
+
+        let order: Vec<_> = e.bindings().map(|v| (v.param, v.modulator)).collect();
+        assert_eq!(order, [(a, m1), (a, m2), (b, m3)]);
+    }
+
+    #[test]
+    fn an_unbound_parameter_reports_no_bindings_rather_than_an_error() {
+        let mut e = ModulationEngine::new();
+        let p = e.register("layer.1.opacity", ParamSpec::unit());
+        e.evaluate(at(0, 1));
+        assert_eq!(e.bindings_for(p).count(), 0);
+        assert!(e.binding(0).is_none());
+    }
+
+    #[test]
+    fn a_band_level_is_readable_as_a_meter_before_any_envelope() {
+        // What a UI draws next to the band: the raw measurement, not the
+        // binding's interpretation of it.
+        let mut e = ModulationEngine::new();
+        let p = e.register("layer.1.opacity", ParamSpec::unit());
+        let m = e.add_source(&audio_band(Some(1), None, 20.0, 250.0));
+        e.bind_full_sweep(p, m).expect("bind");
+        let request = e.band_requests().next().expect("one request");
+        e.set_input(request.slot, 0.75);
+        e.evaluate(at(0, 1));
+        assert_eq!(e.input(request.slot), Some(0.75));
+        assert!(
+            e.binding(0).expect("binding").signal < 0.75,
+            "the envelope lags the measurement, which is the point of showing both"
+        );
+    }
+
+    #[test]
+    fn introspection_does_not_disturb_the_frame_loop() {
+        // It reads the last evaluation; it must not advance anything.
+        let mut e = ModulationEngine::new();
+        let p = e.register("layer.1.opacity", ParamSpec::unit());
+        let m = e.add_source(&ModSource::BeatLfo {
+            shape: LfoShape::Sine,
+            beats: 4.0,
+            phase: 0.0,
+        });
+        e.bind_full_sweep(p, m).expect("bind");
+        e.evaluate(at(1, 2));
+        let before = e.value(p);
+        for _ in 0..10 {
+            let _ = e.bindings().count();
+        }
+        assert_eq!(e.value(p), before);
     }
 }

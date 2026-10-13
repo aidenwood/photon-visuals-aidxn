@@ -7,7 +7,9 @@ struct TransportBar: View {
         PanelBoundary(model: model.transport, retry: { model.reloadTransport() }) { snapshot in
             TransportControls(
                 snapshot: snapshot, busy: model.transport.phase.isLoading,
-                toggle: model.togglePlayback
+                toggle: model.togglePlayback,
+                setBPM: model.setBPM,
+                tap: { model.tapTempo() }
             )
         } skeleton: {
             HStack(spacing: 8) {

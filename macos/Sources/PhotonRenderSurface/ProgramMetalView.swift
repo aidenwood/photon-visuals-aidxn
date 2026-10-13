@@ -166,17 +166,6 @@ public final class ProgramMetalView: NSView {
 
     // MARK: - Composition
 
-    /// The inspector's blend names, as the engine knows them. An unrecognised
-    /// name falls back to `.over` rather than to a different-looking blend.
-    private static func blend(_ name: String) -> BlendMode {
-        switch name {
-        case "Add": return .add
-        case "Multiply": return .multiply
-        case "Screen": return .screen
-        default: return .over
-        }
-    }
-
     /// Applies the workspace's composition to this surface.
     ///
     /// This is the whole point of the view: what a grid trigger launches is
@@ -191,6 +180,10 @@ public final class ProgramMetalView: NSView {
         applied = plan
         engine.masterOpacity = Float(plan.masterOpacity)
         engine.blackout = plan.blackout
+        engine.bpm = plan.bpm
+        // Set before `setLayers` so a source opened by this same call inherits
+        // the transport rather than playing for one apply and then stopping.
+        engine.isPlaying = plan.playing
         // Index is the stable layer identity here: the plan always carries the
         // full stack in draw order, so a bypassed or cleared layer keeps its
         // slot and its neighbours keep their already-open sources.
@@ -198,8 +191,17 @@ public final class ProgramMetalView: NSView {
             LayerState(
                 id: index,
                 name: layer.name,
-                opacity: Float(layer.opacity),
-                blend: Self.blend(layer.blendMode),
+                // Resolume semantics: the clip's fader and the layer's master
+                // are independent and multiply. The engine holds one opacity
+                // per layer, so the product is formed here — the only place
+                // that knows both values — rather than either control
+                // overwriting the other's state upstream.
+                opacity: Float(layer.opacity * layer.clipOpacity),
+                // `BlendMode(rawValue:)` is the whole translation. There is no
+                // name table to fall out of step with the enum; an id the
+                // engine does not define falls back to `.over`, which is the
+                // compositor's own default rather than a different-looking mode.
+                blend: BlendMode(rawValue: layer.blendModeID) ?? .over,
                 bypassed: layer.bypassed,
                 soloed: layer.soloed,
                 clipURL: layer.url,

@@ -3,11 +3,15 @@ import Foundation
 /// UI fixtures only: no media decoder, renderer, hardware output, or measured FPS.
 public actor PreviewWorkspaceProvider: WorkspaceProvider {
     private let latency: Duration
-    private var opacities: [String: Double] = [:]
-    // Not private: the layer snapshot reports the active clip's blend so the
-    // render surface can apply it. A stored-only blend control is a lie.
-    var blendModes: [String: String] = [:]
+    // Not private: the layer snapshot reports the active clip's opacity so the
+    // render surface can multiply it into the layer's. A stored-only opacity
+    // fader that looks identical to a live one is the worst control in a VJ app.
+    var opacities: [String: Double] = [:]
+    // Blend is layer-owned, as it is in the engine. Keyed by layer id, valued
+    // by the engine's `BlendMode` raw value.
+    var layerBlendModes: [String: Int32] = [:]
     var playing = false
+    var bpm: Double = 120
     var layerOpacities: [String: Double] = [:]
     var bypassedLayers: Set<String> = []
     var soloLayers: Set<String> = []
@@ -20,6 +24,12 @@ public actor PreviewWorkspaceProvider: WorkspaceProvider {
     let columnCount: Int
     let deckTitle: String
     let effectDefinitions: [EffectDefinition]
+    /// The blend modes the engine published. Injected for the same reason
+    /// `effectDefinitions` is: the provider must reject a mode the renderer
+    /// cannot run, and it cannot import the render package to find out which.
+    /// Empty means nothing but the default has been published, so only the
+    /// default is accepted — never "accept anything and hope".
+    let blendModeOptions: [BlendModeOption]
     var effectStacks: [InspectorEffectScope: [InspectorEffect]] = [:]
     static let layerIDs = ["layer-4", "layer-3", "layer-2", "layer-1"]
 
@@ -37,8 +47,9 @@ public actor PreviewWorkspaceProvider: WorkspaceProvider {
     // Editable clip instances are distinct even when several slots use one asset.
     static func instanceID(layer: String, column: Int) -> String { "afterlight-\(layer)-clip-\(column)" }
 
-    public init(latency: Duration = .milliseconds(320), clips: [MediaClip]? = nil, deckTitle: String = "Afterlight", effectDefinitions: [EffectDefinition] = []) {
+    public init(latency: Duration = .milliseconds(320), clips: [MediaClip]? = nil, deckTitle: String = "Afterlight", effectDefinitions: [EffectDefinition] = [], blendModeOptions: [BlendModeOption] = []) {
         self.latency = latency
+        self.blendModeOptions = blendModeOptions
         self.mediaClips = clips ?? Self.clips
         self.populatedColumns = clips?.count ?? 4
         self.columnCount = max(12, clips?.count ?? 4)
@@ -70,10 +81,7 @@ public actor PreviewWorkspaceProvider: WorkspaceProvider {
     public func inspector(clipID: String?) async throws -> InspectorSnapshot {
         try await pause()
         let clip = try clip(clipID)
-        return InspectorSnapshot(
-            clip: clip, opacity: opacities[clip.id] ?? 1,
-            blendMode: blendModes[clip.id] ?? "Normal"
-        )
+        return InspectorSnapshot(clip: clip, opacity: opacities[clip.id] ?? 1)
     }
 
     public func outputs() async throws -> OutputSnapshot {
@@ -86,7 +94,7 @@ public actor PreviewWorkspaceProvider: WorkspaceProvider {
 
     public func transport() async throws -> TransportSnapshot {
         try await pause()
-        return TransportSnapshot(isPlaying: playing, bpm: 120)
+        return TransportSnapshot(isPlaying: playing, bpm: bpm)
     }
 
     public func telemetry() async throws -> TelemetrySnapshot {
@@ -103,14 +111,16 @@ public actor PreviewWorkspaceProvider: WorkspaceProvider {
                 throw PanelIssue(title: "Change rejected", message: "Opacity must be between 0 and 100%.")
             }
             opacities[clipID] = value
-        case let .setBlendMode(clipID, value):
-            _ = try clip(clipID)
-            guard ["Normal", "Add", "Multiply", "Screen"].contains(value) else {
-                throw PanelIssue(title: "Change rejected", message: "This blend mode is unavailable.")
-            }
-            blendModes[clipID] = value
         case let .setPlaying(value):
             playing = value
+        case let .setBPM(value):
+            // Matches `TransportSnapshot.validated()`. Rejecting here as well
+            // means a bad tap never reaches the engine's `bpm`, which every
+            // BPM-synced clip reads in the same frame.
+            guard value.isFinite, (20...300).contains(value) else {
+                throw PanelIssue(title: "Change rejected", message: "Tempo must be between 20 and 300 BPM.")
+            }
+            bpm = value
         case .addEffect, .removeEffect, .setEffectEnabled, .setEffectParameter, .moveEffect:
             try performEffect(action)
         default:

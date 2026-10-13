@@ -7,6 +7,10 @@ enum UIRecoveryCase: String, CaseIterable, Sendable {
     case previewDimensions, duplicateIDs, controlValues, unknownTelemetry, malformedTelemetry, unknownID
     case gridSlots, commandCoalescing, commandLifetime, rapidBlackout
     case deckPlayback, clipInstances
+    case buskingDuringDrag, rejectedFaderSnapsBack
+    case clipOpacityReachesLayer, clipOpacityScopedToItsLayer
+    case blendModeRoundTrip, unpublishedBlendModeRefused
+    case transportAndTempo, tapTempo
     case effectDropReachesRenderer, effectDropSelectsScope, effectDropRejectsUnknownKind
     case effectClipChainOrder, effectRemovalClearsRenderer
 
@@ -35,6 +39,14 @@ enum UIRecoveryCase: String, CaseIterable, Sendable {
         case .rapidBlackout: try await controls.rapidBlackoutPressesUseTheLatestRequestedState()
         case .deckPlayback: try await controls.browsingAnEmptyDeckKeepsPlayingClips()
         case .clipInstances: try await controls.clipInstancesHaveIndependentControlsForASharedAsset()
+        case .buskingDuringDrag: try await controls.draggingAFaderReachesTheRendererOnEveryEventNotOnRelease()
+        case .rejectedFaderSnapsBack: try await controls.aRejectedFaderValueSnapsBackToWhatTheProviderHolds()
+        case .clipOpacityReachesLayer: try await controls.clipOpacityAndLayerOpacityBothReachTheLayerSnapshot()
+        case .clipOpacityScopedToItsLayer: try await controls.clipOpacityOnlyAppliesToTheLayerPlayingThatClip()
+        case .blendModeRoundTrip: try await controls.everyPublishedBlendModeRoundTripsToTheLayerSnapshot()
+        case .unpublishedBlendModeRefused: try await controls.aBlendModeTheRendererNeverPublishedIsRefused()
+        case .transportAndTempo: try await controls.transportAndTempoReachTheSnapshotTheRendererReads()
+        case .tapTempo: try await controls.tapTempoCommitsTheTappedTempo()
         case .effectDropReachesRenderer: try await effects.aDropOnALayerReachesTheChainTheRendererReads()
         case .effectDropSelectsScope: try await effects.aDropSelectsTheScopeItLandedIn()
         case .effectDropRejectsUnknownKind: try await effects.anEffectTheEngineNeverPublishedIsRefused()

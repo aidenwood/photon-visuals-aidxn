@@ -56,15 +56,20 @@ public struct PreviewSnapshot: Sendable {
     }
 }
 
+/// The Clip tab's own state.
+///
+/// Carries no blend mode. Blending is a property of a **layer** in the engine
+/// (`LayerState.blend`) and in Resolume, and there is exactly one of them per
+/// layer; a per-clip copy had nowhere to go and was stored and discarded. The
+/// Clip tab still offers a Blend control — it edits the blend of the layer the
+/// clip is playing on, read live from the layer stack.
 public struct InspectorSnapshot: Sendable {
     public let clip: MediaClip
     public let opacity: Double
-    public let blendMode: String
 
-    public init(clip: MediaClip, opacity: Double, blendMode: String) {
+    public init(clip: MediaClip, opacity: Double) {
         self.clip = clip
         self.opacity = opacity
-        self.blendMode = blendMode
     }
 
     public func validated() throws -> Self {

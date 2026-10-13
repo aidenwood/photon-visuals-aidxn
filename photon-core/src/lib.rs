@@ -25,6 +25,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs, clippy::all)]
 
+pub mod beat;
 pub mod budget;
 pub mod clock;
 pub mod codec;

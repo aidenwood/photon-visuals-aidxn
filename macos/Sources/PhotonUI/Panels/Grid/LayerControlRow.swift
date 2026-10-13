@@ -3,8 +3,13 @@ import SwiftUI
 struct LayerControlRow: View {
     let layer: LayerSnapshot
     let selected: Bool
+    /// The layer's opacity including an in-progress drag, so the strip fader
+    /// and the output never disagree about where the fader is.
+    let liveOpacity: Double
+    let blendModeOptions: [BlendModeOption]
     let select: () -> Void
     let opacity: (Double) -> Void
+    let blend: (Int32) -> Void
     let bypass: () -> Void
     let solo: () -> Void
 
@@ -19,8 +24,9 @@ struct LayerControlRow: View {
                 layerButton("S", active: layer.solo, help: "Solo \(layer.title)", action: solo)
             }
             HStack(spacing: 4) {
-                Text("Normal").font(.system(size: 9)).foregroundStyle(PhotonTheme.muted)
-                LiveFader(value: layer.opacity, label: "\(layer.title) opacity", change: opacity)
+                CompactBlendMenu(options: blendModeOptions, value: layer.blendModeID,
+                                 title: layer.title, select: blend)
+                LiveFader(value: liveOpacity, label: "\(layer.title) opacity", change: opacity)
             }
         }
         .padding(PhotonTheme.contentInset)

@@ -24,6 +24,7 @@
 //! corruption rather than a clean crash.
 
 use photon_core::clock::Clock;
+use photon_core::codec::{dxv, CodecError, TextureFormat};
 use photon_core::doc::{Curve, LfoShape, ModSource, Rational, TempoSource};
 use photon_core::learn::{
     Action, ControlMap, ControlRouter, ControlSource, ControlValue, Ignored, Routed, Target,
@@ -221,6 +222,13 @@ fn rebuild_modulation(core: &mut PhotonCore) {
             continue;
         };
         let source = core.modulation.add_source(&ModSource::AudioBand {
+            // This FFI path predates the audio stage and drives a single
+            // analyser, so its bindings name no input — which resolves to
+            // `AudioStage::default_input`, exactly what they meant before
+            // inputs existed. A multi-input shell binds through the document
+            // instead and names its input there.
+            input: None,
+            band: None,
             low_hz: b.low_hz,
             high_hz: b.high_hz,
             attack_ms: b.attack_ms,
@@ -517,6 +525,7 @@ pub extern "C" fn photon_document_default() -> PhotonString {
             phase_source: PhaseSource::default(),
             quantise: Quantise::default(),
         },
+        audio: AudioStage::default(),
         layers: vec![],
         clips: vec![],
         sources: vec![],
@@ -1104,6 +1113,227 @@ pub extern "C" fn photon_rational_to_f64(num: i64, den: i64) -> f64 {
     Rational::new(num, den).to_f64()
 }
 
+// ───────────────────────────── DXV decode ───────────────────────────────────
+//
+// The shell demuxes — AVFoundation on macOS, libavformat on Windows — and hands
+// in one compressed DXV frame. The core undoes the LZ layer and hands back
+// **BC1/BC3 blocks**, never pixels, because the frames being already GPU
+// block-compressed is the entire reason DXV is cheap to play. Expanding to RGBA
+// here (which is what FFmpeg's own DXV decoder does) would throw that away.
+//
+// ## Lifetime
+//
+// `PhotonDxvFrame.data` points into a buffer owned by the decoder and is valid
+// **until the next `photon_dxv_decode` on the same decoder** — the same rule as
+// `photon_tick`, for the same reason: the shell copies it into a texture within
+// the frame and never retains it.
+//
+// ## One decoder per layer
+//
+// DXV has no chunk table; a frame is one contiguous LZ stream and cannot be
+// split across workers. Parallelism is across layers, so each layer owns a
+// decoder and its own output buffer, and nothing is shared.
+
+/// Status of a DXV decode. Values are ABI; mirrored in `photon_ffi.h`.
+mod dxv_status {
+    pub const OK: i32 = 0;
+    pub const NULL_ARG: i32 = 1;
+    pub const TRUNCATED: i32 = 2;
+    pub const MALFORMED: i32 = 3;
+    pub const UNKNOWN_FORMAT: i32 = 4;
+    pub const UNKNOWN_COMPRESSOR: i32 = 5;
+    pub const BAD_DISTANCE: i32 = 6;
+    pub const NOT_DERIVED: i32 = 7;
+}
+
+/// Texture-format discriminants. ABI; mirrors `photon_core::codec::TextureFormat`.
+mod dxv_format {
+    pub const BC1_RGB: i32 = 0;
+    pub const BC3_RGBA: i32 = 1;
+    pub const BC3_YCOCG: i32 = 2;
+    pub const BC4_ALPHA: i32 = 3;
+    pub const BC6H_UNSIGNED: i32 = 4;
+    pub const BC6H_SIGNED: i32 = 5;
+    pub const BC7_RGBA: i32 = 6;
+}
+
+const fn format_code(f: TextureFormat) -> i32 {
+    match f {
+        TextureFormat::Bc1Rgb => dxv_format::BC1_RGB,
+        TextureFormat::Bc3Rgba => dxv_format::BC3_RGBA,
+        TextureFormat::Bc3YCoCg => dxv_format::BC3_YCOCG,
+        TextureFormat::Bc4Alpha => dxv_format::BC4_ALPHA,
+        TextureFormat::Bc6hUnsigned => dxv_format::BC6H_UNSIGNED,
+        TextureFormat::Bc6hSigned => dxv_format::BC6H_SIGNED,
+        TextureFormat::Bc7Rgba => dxv_format::BC7_RGBA,
+    }
+}
+
+const fn status_code(e: CodecError) -> i32 {
+    match e {
+        CodecError::Truncated { .. } => dxv_status::TRUNCATED,
+        CodecError::Malformed(_) => dxv_status::MALFORMED,
+        CodecError::UnknownTextureFormat(_) => dxv_status::UNKNOWN_FORMAT,
+        CodecError::UnknownCompressor(_) => dxv_status::UNKNOWN_COMPRESSOR,
+        CodecError::BadDistance { .. } => dxv_status::BAD_DISTANCE,
+        CodecError::NotDerived => dxv_status::NOT_DERIVED,
+    }
+}
+
+/// Opaque per-layer DXV decoder. Owns the output buffer.
+pub struct PhotonDxvDecoder {
+    out: Vec<u8>,
+    /// Held so `photon_dxv_last_error` can say what actually went wrong rather
+    /// than only which category it fell into.
+    last_error: std::ffi::CString,
+}
+
+/// One decoded frame's worth of block data.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct PhotonDxvFrame {
+    /// Pointer to `len` bytes of BC blocks, or null on failure.
+    ///
+    /// Valid until the next decode on the same decoder.
+    pub data: *const u8,
+    /// Length of `data` in bytes.
+    pub len: u32,
+    /// `PHOTON_TEX_*`, or -1 on failure.
+    pub format: i32,
+    /// Padded texture width — the visible frame is the top-left crop.
+    pub texture_width: u32,
+    /// Padded texture height.
+    pub texture_height: u32,
+    /// Non-zero if the texture carries **premultiplied** RGB and the sampler
+    /// must divide it back out. True for DXV's DXT5; false for DXT1, which has
+    /// no alpha to premultiply by.
+    pub premultiplied: u32,
+    /// `PHOTON_DXV_*`.
+    pub status: i32,
+}
+
+impl PhotonDxvFrame {
+    const fn failed(status: i32) -> Self {
+        Self {
+            data: std::ptr::null(),
+            len: 0,
+            format: -1,
+            texture_width: 0,
+            texture_height: 0,
+            premultiplied: 0,
+            status,
+        }
+    }
+}
+
+/// Creates a DXV decoder. Returns null only if allocation fails.
+///
+/// # Safety
+/// Release with [`photon_dxv_decoder_destroy`] exactly once.
+#[no_mangle]
+pub extern "C" fn photon_dxv_decoder_create() -> *mut PhotonDxvDecoder {
+    Box::into_raw(Box::new(PhotonDxvDecoder {
+        out: Vec::new(),
+        last_error: std::ffi::CString::default(),
+    }))
+}
+
+/// Releases a decoder. Null is a no-op.
+///
+/// # Safety
+/// `d` must come from [`photon_dxv_decoder_create`] and must not be used after.
+#[no_mangle]
+pub unsafe extern "C" fn photon_dxv_decoder_destroy(d: *mut PhotonDxvDecoder) {
+    if !d.is_null() {
+        drop(unsafe { Box::from_raw(d) });
+    }
+}
+
+/// Decodes one DXV frame to BC blocks.
+///
+/// `frame`/`len` are one compressed sample as the demuxer delivered it, header
+/// included. `width`/`height` are the **visible** frame size.
+///
+/// A null handle or buffer returns a failed frame rather than trapping — a
+/// shell bug must not take the process down mid-show.
+///
+/// # Safety
+/// `frame` must point to `len` readable bytes, and `d` must come from
+/// [`photon_dxv_decoder_create`].
+#[no_mangle]
+pub unsafe extern "C" fn photon_dxv_decode(
+    d: *mut PhotonDxvDecoder,
+    frame: *const u8,
+    len: u32,
+    width: u32,
+    height: u32,
+) -> PhotonDxvFrame {
+    if d.is_null() || frame.is_null() || len == 0 {
+        return PhotonDxvFrame::failed(dxv_status::NULL_ARG);
+    }
+    let dec = unsafe { &mut *d };
+    let buf = unsafe { std::slice::from_raw_parts(frame, len as usize) };
+
+    let parsed = match dxv::parse_frame(buf) {
+        Ok(f) => f,
+        Err(e) => return dec.fail(e),
+    };
+    let blocks = match dxv::decode_texture(&parsed, buf, width, height) {
+        Ok(b) => b,
+        Err(e) => return dec.fail(e),
+    };
+
+    let (tw, th) = dxv::texture_dims(width, height);
+    dec.out = blocks;
+    dec.last_error = std::ffi::CString::default();
+    PhotonDxvFrame {
+        data: dec.out.as_ptr(),
+        len: dec.out.len() as u32,
+        format: format_code(parsed.format),
+        texture_width: tw,
+        texture_height: th,
+        // DXV premultiplies only where there is alpha. BC1 carries none.
+        premultiplied: u32::from(parsed.format == TextureFormat::Bc3Rgba),
+        status: dxv_status::OK,
+    }
+}
+
+impl PhotonDxvDecoder {
+    fn fail(&mut self, e: CodecError) -> PhotonDxvFrame {
+        self.last_error =
+            std::ffi::CString::new(e.to_string()).unwrap_or_else(|_| std::ffi::CString::default());
+        PhotonDxvFrame::failed(status_code(e))
+    }
+}
+
+/// The last decode failure on this decoder, as a NUL-terminated string.
+///
+/// Owned by the decoder, valid until the next decode. Never null — an empty
+/// string means there is nothing to report.
+///
+/// This exists because "not derived" and "back-reference 812 beyond 44 written
+/// units" are different operator problems: one means re-encode the clip, the
+/// other means the file is damaged.
+///
+/// # Safety
+/// `d` must come from [`photon_dxv_decoder_create`].
+#[no_mangle]
+pub unsafe extern "C" fn photon_dxv_last_error(
+    d: *const PhotonDxvDecoder,
+) -> *const std::os::raw::c_char {
+    if d.is_null() {
+        return c"null decoder".as_ptr();
+    }
+    unsafe { (*d).last_error.as_ptr() }
+}
+
+/// Struct stride, asserted against `MemoryLayout` on the Swift side so a layout
+/// drift fails loudly instead of yielding subtly wrong values.
+#[no_mangle]
+pub extern "C" fn photon_dxv_frame_stride() -> u32 {
+    std::mem::size_of::<PhotonDxvFrame>() as u32
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1682,6 +1912,122 @@ mod tests {
             let (mut lo, mut hi) = (0.0f32, 0.0f32);
             assert!(!photon_audio_band(null, 0, &mut lo, &mut hi));
             assert!(!photon_set_audio_band(null, 0, 1.0));
+        }
+    }
+
+    // ───────────────────────────── DXV ──────────────────────────────────
+
+    /// A DXV frame header with a chosen tag, in RAW mode so the test exercises
+    /// the crossing rather than re-testing the core's LZ decoder.
+    fn dxv_raw_frame(tag: &[u8; 4], payload: usize) -> Vec<u8> {
+        let mut rev = *tag;
+        rev.reverse(); // tags are stored byte-reversed on disk
+        let mut v = rev.to_vec();
+        v.extend_from_slice(&[0x04, 0x00, 0x01, 0x00]); // DXV3, raw
+        v.extend_from_slice(&(payload as u32).to_le_bytes());
+        v.extend((0..payload).map(|i| i as u8));
+        v
+    }
+
+    #[test]
+    fn dxv_blocks_cross_the_boundary_without_an_rgba_round_trip() {
+        unsafe {
+            let d = photon_dxv_decoder_create();
+            // 16x4 visible = 4x1 BC1 blocks = 32 bytes. If this ever came back
+            // as 16*4*4 = 256 the pixels were expanded, which is the one thing
+            // this path must never do.
+            let f = dxv_raw_frame(b"DXT1", 32);
+            let r = photon_dxv_decode(d, f.as_ptr(), f.len() as u32, 16, 4);
+            assert_eq!(r.status, dxv_status::OK);
+            assert_eq!(r.format, dxv_format::BC1_RGB);
+            assert_eq!(r.len, 32);
+            assert_eq!((r.texture_width, r.texture_height), (16, 4));
+            assert_eq!(r.premultiplied, 0, "BC1 has no alpha to premultiply by");
+            let blocks = std::slice::from_raw_parts(r.data, r.len as usize);
+            assert_eq!(blocks[..4], [0, 1, 2, 3]);
+            photon_dxv_decoder_destroy(d);
+        }
+    }
+
+    #[test]
+    fn dxt5_is_flagged_premultiplied_so_the_sampler_divides_it_out() {
+        unsafe {
+            let d = photon_dxv_decoder_create();
+            let f = dxv_raw_frame(b"DXT5", 64); // 16x4 -> 4x1 BC3 blocks
+            let r = photon_dxv_decode(d, f.as_ptr(), f.len() as u32, 16, 4);
+            assert_eq!(r.status, dxv_status::OK);
+            assert_eq!(r.format, dxv_format::BC3_RGBA);
+            assert_eq!(r.premultiplied, 1, "skip this and the clip renders dark");
+            photon_dxv_decoder_destroy(d);
+        }
+    }
+
+    #[test]
+    fn padding_is_reported_so_the_shell_can_crop() {
+        unsafe {
+            let d = photon_dxv_decoder_create();
+            // 1366 pads to 1376 wide. A shell that sampled 0..1 of the texture
+            // would show ten columns of garbage down the right-hand edge.
+            let f = dxv_raw_frame(b"DXT1", 1376 * 768 / 2);
+            let r = photon_dxv_decode(d, f.as_ptr(), f.len() as u32, 1366, 768);
+            assert_eq!(r.status, dxv_status::OK);
+            assert_eq!((r.texture_width, r.texture_height), (1376, 768));
+            photon_dxv_decoder_destroy(d);
+        }
+    }
+
+    #[test]
+    fn undecodable_variants_say_so_instead_of_returning_pixels() {
+        unsafe {
+            let d = photon_dxv_decoder_create();
+            let f = dxv_raw_frame(b"YCG6", 64);
+            // Raw YCoCg blocks pass through — it is the *compressed* form that
+            // is underived — so force the compressed path to assert on it.
+            let mut c = f.clone();
+            c[6] = 0;
+            let r = photon_dxv_decode(d, c.as_ptr(), c.len() as u32, 16, 4);
+            assert_eq!(r.status, dxv_status::NOT_DERIVED);
+            assert!(r.data.is_null(), "never hand back a buffer we did not fill");
+            let msg = std::ffi::CStr::from_ptr(photon_dxv_last_error(d))
+                .to_string_lossy()
+                .into_owned();
+            assert!(msg.contains("not derived"), "{msg}");
+            photon_dxv_decoder_destroy(d);
+        }
+    }
+
+    #[test]
+    fn every_dxv_entry_point_tolerates_a_null_handle() {
+        unsafe {
+            let null = std::ptr::null_mut::<PhotonDxvDecoder>();
+            let r = photon_dxv_decode(null, [0u8; 16].as_ptr(), 16, 16, 4);
+            assert_eq!(r.status, dxv_status::NULL_ARG);
+            assert!(r.data.is_null());
+            let d = photon_dxv_decoder_create();
+            let r = photon_dxv_decode(d, std::ptr::null(), 0, 16, 4);
+            assert_eq!(r.status, dxv_status::NULL_ARG);
+            assert!(!photon_dxv_last_error(null).is_null());
+            photon_dxv_decoder_destroy(d);
+            photon_dxv_decoder_destroy(null);
+        }
+    }
+
+    #[test]
+    fn a_corrupt_frame_is_an_error_not_a_crash() {
+        unsafe {
+            let d = photon_dxv_decoder_create();
+            let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+            for _ in 0..500 {
+                let mut buf = Vec::with_capacity(64);
+                for _ in 0..64 {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    buf.push((seed >> 32) as u8);
+                }
+                let _ = photon_dxv_decode(d, buf.as_ptr(), buf.len() as u32, 64, 16);
+            }
+            photon_dxv_decoder_destroy(d);
         }
     }
 }

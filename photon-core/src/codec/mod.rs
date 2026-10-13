@@ -7,7 +7,31 @@
 //!
 //! What lives here is the part that is genuinely ours and genuinely portable:
 //! given a frame payload, work out **what texture format it is and what decode
-//! work it implies**. No I/O, no decompression, no allocation of pixel data.
+//! work it implies** — and, for DXV, actually do that work. No I/O, and no
+//! pixel data is ever produced; the output is GPU blocks.
+//!
+//! ## 🔶 [DECISION, amended] Decompression *does* live here now
+//!
+//! This header used to read "No I/O, no decompression", and that was a real
+//! decision, not an oversight — it kept the crate to pure description and left
+//! every byte-shuffling pass to the shell. [`dxv`] breaks it deliberately, and
+//! the reason is the same reason this crate exists at all:
+//!
+//! - The DXV LZ layer is **pure CPU work over a byte slice**. It touches no
+//!   platform API, allocates one `Vec<u8>`, and compiles for wasm32 — so
+//!   nothing about it was keeping the crate portable by being absent.
+//! - Nothing can decode it for us. FFmpeg's DXV decoder exists but emits RGBA,
+//!   which throws away the one property that makes DXV cheap to play; we need
+//!   the BC blocks, so the code has to be written by hand either way.
+//! - Shell-side, it would be written **twice** — once in Swift, once again for
+//!   Windows — and the second copy would drift from the first. Two divergent
+//!   implementations of one byte-exact format is precisely the failure
+//!   `photon-core` is here to prevent.
+//!
+//! The boundary that still holds, and the one that actually mattered, is
+//! **I/O and containers**: no file handles, no demuxing, no libavformat. The
+//! shell hands in a frame buffer and the visible dimensions; the core hands
+//! back blocks.
 
 pub mod dxv;
 pub mod hap;

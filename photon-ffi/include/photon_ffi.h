@@ -105,6 +105,54 @@ bool        photon_audio_band(const PhotonCore *h, uint32_t index,
                               float *low_hz, float *high_hz);
 bool        photon_set_audio_band(PhotonCore *h, uint32_t index, float value);
 
+/* DXV decode.
+
+   The shell demuxes (AVFoundation here, libavformat on Windows) and hands in
+   one compressed DXV frame. The core undoes the LZ layer and hands back BC1 or
+   BC3 BLOCKS — never pixels. The frames being already GPU block-compressed is
+   the whole reason DXV is cheap to play; expanding to RGBA, which is what
+   FFmpeg's own DXV decoder does, throws that away.
+
+   `data` is owned by the decoder and valid only until the next decode on the
+   same decoder — the same rule as PhotonFrame.
+
+   One decoder per layer: DXV has no chunk table, so a frame is a single
+   contiguous LZ stream that cannot be split across workers. */
+
+typedef struct PhotonDxvDecoder PhotonDxvDecoder;
+
+enum { PHOTON_DXV_OK = 0, PHOTON_DXV_NULL_ARG = 1, PHOTON_DXV_TRUNCATED = 2,
+       PHOTON_DXV_MALFORMED = 3, PHOTON_DXV_UNKNOWN_FORMAT = 4,
+       PHOTON_DXV_UNKNOWN_COMPRESSOR = 5, PHOTON_DXV_BAD_DISTANCE = 6,
+       /* YCG6 / YG10. Returned rather than guessed: plausible-looking wrong
+          pixels in a live show are worse than a clip that refuses to load. */
+       PHOTON_DXV_NOT_DERIVED = 7 };
+
+enum { PHOTON_TEX_BC1_RGB = 0, PHOTON_TEX_BC3_RGBA = 1, PHOTON_TEX_BC3_YCOCG = 2,
+       PHOTON_TEX_BC4_ALPHA = 3, PHOTON_TEX_BC6H_UNSIGNED = 4,
+       PHOTON_TEX_BC6H_SIGNED = 5, PHOTON_TEX_BC7_RGBA = 6 };
+
+/* texture_width/height are PADDED (width aligns to 16, height to 4); the
+   visible frame is the top-left crop, so a sampler must scale by
+   width/texture_width.
+
+   premultiplied != 0 means the RGB in the blocks is multiplied by alpha and the
+   SAMPLER must divide it back out: out = min(1, c / a), passing c through when
+   a == 0. True for DXV's DXT5. Skip it and every real Resolume DXT5 asset
+   renders visibly dark. */
+typedef struct { const uint8_t *data; uint32_t len; int32_t format;
+                 uint32_t texture_width; uint32_t texture_height;
+                 uint32_t premultiplied; int32_t status; } PhotonDxvFrame;
+
+PhotonDxvDecoder *photon_dxv_decoder_create(void);
+void              photon_dxv_decoder_destroy(PhotonDxvDecoder *d);
+PhotonDxvFrame    photon_dxv_decode(PhotonDxvDecoder *d, const uint8_t *frame,
+                                    uint32_t len, uint32_t width, uint32_t height);
+/* Owned by the decoder, valid until the next decode. Never NULL; empty means
+   nothing to report. */
+const char       *photon_dxv_last_error(const PhotonDxvDecoder *d);
+uint32_t          photon_dxv_frame_stride(void);
+
 uint32_t    photon_abi_version(void);
 uint32_t    photon_layer_stride(void);
 uint32_t    photon_frame_stride(void);

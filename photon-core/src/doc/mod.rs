@@ -21,10 +21,15 @@
 
 use serde::{Deserialize, Serialize};
 
+mod audio;
 mod color;
 mod ids;
 mod rational;
 
+pub use audio::{
+    AudioBandDef, AudioDeviceRef, AudioInput, AudioStage, BeatDetectConfig, ChannelMap,
+    DeviceMatch, ResolvedBand,
+};
 pub use color::{AlphaMode, ColorDescriptor, MatrixCoefficients, Primaries, Range, Transfer};
 pub use ids::{Id, IdAllocator};
 pub use rational::Rational;
@@ -45,7 +50,15 @@ pub use rational::Rational;
 /// with `unknown field "playback"`, which tells an operator standing in a venue
 /// nothing. With the bump it fails with "saved by a newer version", which tells
 /// them exactly what to do. That is the entire job of this constant.
-pub const SCHEMA_VERSION: u32 = 1;
+///
+/// **v2** added the audio stage ([`Document::audio`]) and gave
+/// [`ModSource::AudioBand`] an input and a band identity. Same mechanism, same
+/// reasoning: both new `ModSource` fields are `Option` with `#[serde(default)]`
+/// and `Document::audio` defaults to an empty stage, so **a v0 or v1 document
+/// loads unchanged**. A v1 audio binding names no input, which resolves to
+/// [`AudioStage::default_input`] — "whatever is listening", which is exactly
+/// what it meant when it was written.
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// A complete Photon project.
 ///
@@ -62,6 +75,14 @@ pub struct Document {
     pub composition: Composition,
     /// Tempo and phase configuration.
     pub clock: ClockConfig,
+    /// Live audio inputs, their bands and their beat detection.
+    ///
+    /// Placed next to [`Document::clock`] and above the layers on purpose:
+    /// audio is the pane the show is built *from*, and tempo now has an
+    /// audio-derived source ([`TempoSource::AudioBeat`]) that reads from here.
+    /// An empty stage is the default and is what a pre-v2 document loads as.
+    #[serde(default)]
+    pub audio: AudioStage,
     /// Layer stack, index 0 = bottom.
     pub layers: Vec<Layer>,
     /// Clips referenced by layers.
@@ -146,6 +167,20 @@ pub enum TempoSource {
     MidiClock,
     /// Ableton Link. Deferred to Photon 3.0/4.0; requires a commercial licence.
     AbletonLink,
+    /// Tempo estimated from one audio input's own band energy.
+    ///
+    /// Names the input because the stage has several and they do not agree —
+    /// the room mic hears the crowd clapping on the two and the four, the booth
+    /// feed hears the record. A tempo source that just said "audio" would be
+    /// unanswerable the moment a second input was enabled.
+    ///
+    /// Tempo only. Beat *phase* from the same input is
+    /// [`PhaseSource::AudioOnset`] and is a separate, deliberately harder
+    /// opt-in — see [`crate::beat`].
+    AudioBeat {
+        /// Which [`AudioInput`] is estimating.
+        input: Id,
+    },
 }
 
 /// Source of beat phase (the downbeat).
@@ -161,6 +196,23 @@ pub enum PhaseSource {
     MidiSpp,
     /// Pioneer Pro DJ Link. Deferred; the reliable phase source for CDJ rigs.
     ProDjLink,
+    /// Beat phase inferred from one audio input's onsets.
+    ///
+    /// Not a default and never selected automatically. Getting a *tempo* out of
+    /// audio is comfortably solvable; getting the beat to land in the right
+    /// place is a different and much weaker problem, and a phase that is
+    /// confidently half a beat out is worse than no phase at all — every
+    /// beat-synced clip in the show lands on the off-beat together, and it
+    /// looks deliberate.
+    ///
+    /// The detector reports its own phase confidence separately from its tempo
+    /// confidence for exactly this reason, and
+    /// [`Clock::offer_audio_beat`](crate::clock::Clock::offer_audio_beat)
+    /// refuses an observation below the bar.
+    AudioOnset {
+        /// Which [`AudioInput`] is estimating.
+        input: Id,
+    },
 }
 
 /// Launch quantisation, in beats. `None` triggers immediately.
@@ -693,10 +745,36 @@ pub struct Binding {
 #[serde(rename_all = "camelCase", tag = "type")]
 pub enum ModSource {
     /// Audio band envelope.
+    ///
+    /// **Which input** and **which band** are both named here, and both are
+    /// optional, which is the whole v1→v2 story. Before the audio stage existed
+    /// a binding could only say "20–250 Hz" and there was exactly one thing
+    /// that could mean. With several inputs live at once that is ambiguous, so
+    /// a v2 binding names its input — and a v1 binding, which names none,
+    /// keeps meaning "whatever is listening" via
+    /// [`AudioStage::default_input`]. Resolve all four fields together with
+    /// [`AudioStage::resolve_band`]; the precedence is defined there and
+    /// nowhere else.
+    ///
+    /// Attack and release live here, with the binding, rather than on the
+    /// band: the core owns the envelope so the Windows shell shares it, and the
+    /// same kick band legitimately wants a 5 ms attack on a strobe and a 400 ms
+    /// release on a slow zoom. Two envelope followers in series — one in the
+    /// shell's analyser, one here — is not smoother, it is laggy and mushy, and
+    /// it gets blamed on the audio interface.
     AudioBand {
-        /// Low edge, Hz.
+        /// Which [`AudioInput`] to follow. `None` means the stage's default
+        /// input, which is what every pre-v2 binding means.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input: Option<Id>,
+        /// Which [`AudioBandDef`] on that input. `None` means the ad-hoc range
+        /// below — a legitimate choice for a one-off, and the only thing a
+        /// pre-v2 binding can express.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        band: Option<Id>,
+        /// Low edge, Hz. Ignored when `band` names a band that exists.
         low_hz: f64,
-        /// High edge, Hz.
+        /// High edge, Hz. Ignored when `band` names a band that exists.
         high_hz: f64,
         /// Attack, milliseconds.
         attack_ms: f64,
@@ -803,6 +881,7 @@ mod tests {
                 phase_source: PhaseSource::FollowTempo,
                 quantise: Quantise::Bar,
             },
+            audio: AudioStage::default(),
             layers: vec![],
             clips: vec![],
             sources: vec![],
@@ -1091,6 +1170,166 @@ mod tests {
         let doc: Document = serde_json::from_str(v0).expect("v0 document must load");
         assert_eq!(doc.schema_version, 0);
         assert_eq!(doc.layers[0].playback, None);
+        assert!(doc.audio.inputs.is_empty(), "no audio stage is an empty one");
+    }
+
+    // ── v1 → v2: the audio stage ────────────────────────────────────────────
+
+    #[test]
+    fn a_v1_audio_binding_still_loads_and_means_what_it_meant() {
+        // The breaking change this schema bump is for. A v1 binding names no
+        // input because inputs did not exist; it must load as "whatever is
+        // listening" rather than failing or silently losing its frequencies.
+        // Snake-case field names, because that is genuinely what is on disk:
+        // `rename_all` on this enum renames its *variants*, not the fields
+        // inside a struct variant. Pinned by
+        // `the_on_disk_spelling_of_an_audio_binding_is_fixed` below — getting
+        // this wrong in a fixture is how a migration test passes against a
+        // format no saved document has ever used.
+        let v1 = r#"{"type":"audioBand","low_hz":20,"high_hz":250,
+            "attack_ms":5,"release_ms":180}"#;
+        let s: ModSource = serde_json::from_str(v1).expect("v1 audio source must load");
+        let ModSource::AudioBand {
+            input,
+            band,
+            low_hz,
+            high_hz,
+            ..
+        } = s
+        else {
+            panic!("wrong variant");
+        };
+        assert_eq!(input, None, "absent input must mean the default input");
+        assert_eq!(band, None, "absent band must mean the ad-hoc range");
+        assert_eq!((low_hz, high_hz), (20.0, 250.0));
+    }
+
+    #[test]
+    fn a_v1_document_loads_whole_with_its_audio_bindings_intact() {
+        let v1 = r#"{
+            "schemaVersion": 1,
+            "meta": {"name":"v1","created":"","modified":"","writtenBy":"0.1.0"},
+            "composition": {"width":1920,"height":1080,
+                "rate":{"num":60,"den":1},"workingSpace":"linearRgba16F"},
+            "clock": {"bpm":128.0,"tempoSource":"tap",
+                "phaseSource":"followTempo","quantise":"bar"},
+            "layers": [], "clips": [], "sources": [],
+            "modulation": [{"target":"layer.1.opacity",
+                "source":{"type":"audioBand","low_hz":20,"high_hz":250,
+                          "attack_ms":5,"release_ms":180},
+                "depth":1.0,"offset":0.0,"curve":"linear","invert":false}]
+        }"#;
+        let doc: Document = serde_json::from_str(v1).expect("v1 document must load");
+        assert_eq!(doc.schema_version, 1);
+        assert!(doc.audio.inputs.is_empty());
+        assert_eq!(doc.modulation.len(), 1);
+    }
+
+    #[test]
+    fn the_on_disk_spelling_of_an_audio_binding_is_fixed() {
+        // Every saved show depends on this exact string. `rename_all` on
+        // `ModSource` renames variants (`audioBand`) but **not** the fields
+        // inside them, so the fields are snake_case while the rest of the
+        // document is camelCase. That inconsistency is not nice, and changing
+        // it now would stop every existing `.photon` file from opening — so it
+        // is pinned here instead, where a well-meaning tidy-up fails loudly.
+        let s = ModSource::AudioBand {
+            input: Some(Id::new(2)),
+            band: None,
+            low_hz: 20.0,
+            high_hz: 250.0,
+            attack_ms: 5.0,
+            release_ms: 180.0,
+        };
+        assert_eq!(
+            serde_json::to_string(&s).expect("serialise"),
+            r#"{"type":"audioBand","input":2,"low_hz":20.0,"high_hz":250.0,"attack_ms":5.0,"release_ms":180.0}"#
+        );
+    }
+
+    #[test]
+    fn an_unset_input_or_band_is_absent_from_json() {
+        // Same rule as the layer override: writing "input": null on every audio
+        // binding is noise in every diff and in every hand-edit.
+        let s = ModSource::AudioBand {
+            input: None,
+            band: None,
+            low_hz: 20.0,
+            high_hz: 250.0,
+            attack_ms: 5.0,
+            release_ms: 180.0,
+        };
+        let json = serde_json::to_string(&s).expect("serialise");
+        assert!(!json.contains("null"), "got {json}");
+    }
+
+    #[test]
+    fn a_binding_that_names_its_input_round_trips() {
+        let s = ModSource::AudioBand {
+            input: Some(Id::new(2)),
+            band: Some(Id::new(7)),
+            low_hz: 20.0,
+            high_hz: 250.0,
+            attack_ms: 5.0,
+            release_ms: 180.0,
+        };
+        let json = serde_json::to_string(&s).expect("serialise");
+        assert_eq!(serde_json::from_str::<ModSource>(&json).unwrap(), s);
+    }
+
+    #[test]
+    fn the_audio_tempo_and_phase_sources_name_their_input() {
+        // A source that just said "audio" would be unanswerable with two
+        // inputs enabled, which is the normal case.
+        let t = TempoSource::AudioBeat { input: Id::new(3) };
+        let p = PhaseSource::AudioOnset { input: Id::new(3) };
+        assert_eq!(
+            serde_json::from_str::<TempoSource>(&serde_json::to_string(&t).unwrap()).unwrap(),
+            t
+        );
+        assert_eq!(
+            serde_json::from_str::<PhaseSource>(&serde_json::to_string(&p).unwrap()).unwrap(),
+            p
+        );
+        // And the old unit variants must still be plain strings, or every
+        // existing document stops loading.
+        assert_eq!(
+            serde_json::to_string(&TempoSource::MidiClock).unwrap(),
+            "\"midiClock\""
+        );
+    }
+
+    #[test]
+    fn a_document_with_two_live_inputs_round_trips() {
+        let mut doc: Document = serde_json::from_str(
+            r#"{
+            "schemaVersion": 2,
+            "meta": {"name":"v2","created":"","modified":"","writtenBy":"0.1.0"},
+            "composition": {"width":1920,"height":1080,
+                "rate":{"num":60,"den":1},"workingSpace":"linearRgba16F"},
+            "clock": {"bpm":128.0,"tempoSource":{"audioBeat":{"input":1}},
+                "phaseSource":"followTempo","quantise":"bar"},
+            "layers": [], "clips": [], "sources": [], "modulation": []
+        }"#,
+        )
+        .expect("v2 document");
+        doc.audio.inputs.push(AudioInput::new(
+            Id::new(1),
+            "Booth",
+            AudioDeviceRef::new("uid-1", "Scarlett 2i2 USB", 2),
+            [Id::new(11), Id::new(12), Id::new(13)],
+        ));
+        doc.audio.inputs.push(AudioInput::new(
+            Id::new(2),
+            "Room",
+            AudioDeviceRef::new("uid-2", "Built-in Microphone", 1),
+            [Id::new(21), Id::new(22), Id::new(23)],
+        ));
+        assert_eq!(doc.audio.enabled().count(), 2);
+        assert_eq!(doc.clock.tempo_source, TempoSource::AudioBeat { input: Id::new(1) });
+
+        let json = serde_json::to_string(&doc).expect("serialise");
+        assert_eq!(serde_json::from_str::<Document>(&json).unwrap(), doc);
     }
 
     #[test]

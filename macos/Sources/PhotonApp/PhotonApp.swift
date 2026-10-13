@@ -13,7 +13,9 @@ struct PhotonApp: App {
     init() {
         let catalog = LocalMediaCatalog()
         mediaCatalog = catalog
-        let model = WorkspaceModel(provider: LocalMediaWorkspaceProvider(catalog: catalog), effectDefinitions: NativeEffectDefinitions.all)
+        let model = WorkspaceModel(provider: LocalMediaWorkspaceProvider(catalog: catalog),
+                                   effectDefinitions: NativeEffectDefinitions.all,
+                                   blendModeOptions: NativeBlendModes.all)
         do {
             _ = try PhotonCoreABI.validate()
         } catch {

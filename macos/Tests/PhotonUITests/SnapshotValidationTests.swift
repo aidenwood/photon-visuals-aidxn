@@ -18,7 +18,7 @@ struct SnapshotValidationTests {
 
     func nonFiniteControlValuesBecomePanelErrors() throws {
         try requirePanelIssue {
-            _ = try InspectorSnapshot(clip: clip, opacity: .nan, blendMode: "Normal").validated()
+            _ = try InspectorSnapshot(clip: clip, opacity: .nan).validated()
         }
         try requirePanelIssue {
             _ = try TransportSnapshot(isPlaying: false, bpm: .infinity).validated()

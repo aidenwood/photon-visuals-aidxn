@@ -42,7 +42,8 @@
 //! timestamps in, which is what keeps this portable and what makes a three-hour
 //! show reproducible in a unit test.
 
-use crate::doc::{ClockConfig, PhaseSource, Quantise, Rational, TempoSource};
+use crate::beat::{DetectedBeat, TempoEstimate, USABLE_CONFIDENCE};
+use crate::doc::{ClockConfig, Id, PhaseSource, Quantise, Rational, TempoSource};
 
 /// Slowest tempo accepted, BPM. Below this, tap intervals collide with the
 /// tap-series timeout and a "tempo" is indistinguishable from two unrelated taps.
@@ -899,6 +900,51 @@ impl Clock {
             phase,
             taps: self.tap_tempo.len(),
         }
+    }
+
+    /// Offers a tempo measured from one audio input.
+    ///
+    /// The **only** route from [`crate::beat`] into musical time, and the one
+    /// place the confidence bar is enforced. Returns whether it was adopted.
+    ///
+    /// Three independent gates, all of which must pass:
+    /// 1. `input` is the configured [`TempoSource::AudioBeat`] input. A second
+    ///    enabled input measuring a different tempo cannot steer the clock just
+    ///    because it is also running.
+    /// 2. The estimate is [`TempoEstimate::is_usable`]. A detector reporting
+    ///    "87 BPM, confidence 0.2" is reporting that it does not know, and a
+    ///    clock that follows it anyway has turned a hedge into a fact. The
+    ///    number should still be *shown* — the operator learns something real
+    ///    from watching it wobble — it just must not move the show.
+    /// 3. [`Clock::set_bpm`]'s own sanity range.
+    ///
+    /// Tempo only. The downbeat is [`Clock::observe_audio_beat`] and is gated
+    /// separately, because the two are not equally reliable.
+    pub fn offer_audio_tempo(&mut self, input: Id, estimate: TempoEstimate) -> bool {
+        if !estimate.is_usable() {
+            return false;
+        }
+        self.set_bpm(TempoSource::AudioBeat { input }, estimate.bpm)
+    }
+
+    /// Reports a beat detected on one audio input.
+    ///
+    /// A thin, honest wrapper over [`Clock::observe_beat`]: it refuses a beat
+    /// whose own confidence is below [`USABLE_CONFIDENCE`] before the clock's
+    /// slew policy ever sees it, because a low-confidence beat is not a noisy
+    /// measurement of the right instant — it is frequently a measurement of the
+    /// *wrong* instant, and the slew would faithfully drag the whole grid onto
+    /// it.
+    ///
+    /// Deliberately **beat**, never downbeat: see [`crate::beat`] for why
+    /// nothing here infers a bar line.
+    pub fn observe_audio_beat(&mut self, input: Id, beat: DetectedBeat) -> Correction {
+        // Spelled out rather than `!(c >= bar)` so the NaN case is visible:
+        // a corrupt confidence must be rejected, and `NaN < bar` is false.
+        if !beat.confidence.is_finite() || beat.confidence < USABLE_CONFIDENCE {
+            return Correction::Rejected(0.0);
+        }
+        self.observe_beat(PhaseSource::AudioOnset { input }, beat.at)
     }
 
     /// The tap estimator, for a count-in display.
@@ -1938,5 +1984,148 @@ mod tests {
         assert!(close(median_of(&[3.0, 1.0, 2.0]), 2.0, 1e-12));
         assert!(close(median_of(&[4.0, 1.0, 3.0, 2.0]), 2.5, 1e-12));
         assert_eq!(median_of(&[]), 0.0);
+    }
+
+    // ─── audio tempo and beat gating ─────────────────────────────────────────
+
+    fn audio_estimate(bpm: f64, confidence: f64) -> TempoEstimate {
+        TempoEstimate { bpm, confidence }
+    }
+
+    #[test]
+    fn a_confident_audio_tempo_is_adopted() {
+        let input = Id::new(3);
+        let mut c = Clock::new(120.0);
+        c.set_tempo_source(TempoSource::AudioBeat { input });
+        assert!(c.offer_audio_tempo(input, audio_estimate(128.0, 0.9)));
+        assert!((c.bpm() - 128.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn a_low_confidence_audio_tempo_is_refused_outright() {
+        // The rule the whole beat module exists for: a detector saying "87,
+        // confidence 0.2" is saying it does not know. A clock that follows it
+        // anyway has turned a hedge into a fact.
+        let input = Id::new(3);
+        let mut c = Clock::new(120.0);
+        c.set_tempo_source(TempoSource::AudioBeat { input });
+        assert!(!c.offer_audio_tempo(input, audio_estimate(87.0, 0.2)));
+        assert!((c.bpm() - 120.0).abs() < 1e-12, "tempo must not have moved");
+    }
+
+    #[test]
+    fn a_tempo_from_a_different_audio_input_cannot_steer_the_clock() {
+        // Several inputs are enabled at once by design and they will disagree.
+        // Only the configured one is the authority.
+        let mut c = Clock::new(120.0);
+        c.set_tempo_source(TempoSource::AudioBeat { input: Id::new(1) });
+        assert!(!c.offer_audio_tempo(Id::new(2), audio_estimate(174.0, 0.95)));
+        assert!((c.bpm() - 120.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn audio_tempo_is_refused_when_tempo_is_owned_by_another_transport() {
+        // Tapping or MIDI clock owns tempo; audio detection still measures and
+        // still displays, it just does not steer.
+        let input = Id::new(1);
+        let mut c = Clock::new(120.0);
+        c.set_tempo_source(TempoSource::MidiClock);
+        assert!(!c.offer_audio_tempo(input, audio_estimate(128.0, 0.99)));
+        assert!((c.bpm() - 120.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn an_audio_tempo_outside_the_sane_range_is_still_rejected() {
+        // Confidence does not buy a pass on the range check.
+        let input = Id::new(1);
+        let mut c = Clock::new(120.0);
+        c.set_tempo_source(TempoSource::AudioBeat { input });
+        assert!(!c.offer_audio_tempo(input, audio_estimate(1000.0, 0.99)));
+        assert!(!c.offer_audio_tempo(input, audio_estimate(f64::NAN, 0.99)));
+        assert!((c.bpm() - 120.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn a_low_confidence_beat_never_reaches_the_slew_policy() {
+        // A weak beat is usually not a noisy measurement of the right instant,
+        // it is a measurement of the wrong one — and the slew would faithfully
+        // drag the entire grid onto it.
+        let input = Id::new(1);
+        let mut c = Clock::new(120.0);
+        c.set_phase_source(PhaseSource::AudioOnset { input });
+        c.start(0.0);
+        c.advance_to(1.0);
+        let before = c.beat_phase();
+        let correction = c.observe_audio_beat(
+            input,
+            DetectedBeat {
+                at: 0.9,
+                confidence: 0.3,
+            },
+        );
+        assert!(!correction.changed_phase());
+        assert!((c.beat_phase() - before).abs() < 1e-12);
+    }
+
+    #[test]
+    fn a_confident_beat_from_the_configured_input_corrects_phase() {
+        let input = Id::new(1);
+        let mut c = Clock::new(120.0);
+        c.set_phase_source(PhaseSource::AudioOnset { input });
+        c.start(0.0);
+        // 120 BPM: beats land every 0.5 s. Report one 0.05 s late.
+        c.advance_to(1.05);
+        let correction = c.observe_audio_beat(
+            input,
+            DetectedBeat {
+                at: 1.05,
+                confidence: 0.95,
+            },
+        );
+        assert!(
+            matches!(correction, Correction::Slewing(_)),
+            "expected a slew, got {correction:?}"
+        );
+    }
+
+    #[test]
+    fn a_beat_from_an_unconfigured_input_is_not_authoritative() {
+        let mut c = Clock::new(120.0);
+        c.set_phase_source(PhaseSource::AudioOnset { input: Id::new(1) });
+        c.start(0.0);
+        c.advance_to(1.0);
+        assert_eq!(
+            c.observe_audio_beat(
+                Id::new(2),
+                DetectedBeat {
+                    at: 1.0,
+                    confidence: 0.99,
+                }
+            ),
+            Correction::NotAuthoritative
+        );
+    }
+
+    #[test]
+    fn audio_tempo_and_audio_phase_stay_independent() {
+        // The separation the clock is built around, now reachable from audio:
+        // follow the booth feed's tempo while the operator's thumb owns the
+        // downbeat. Detecting a BPM must not quietly take over phase too.
+        let input = Id::new(1);
+        let mut c = Clock::new(120.0);
+        c.set_tempo_source(TempoSource::AudioBeat { input });
+        c.set_phase_source(PhaseSource::Tap);
+        assert!(c.offer_audio_tempo(input, audio_estimate(128.0, 0.9)));
+        assert_eq!(
+            c.observe_audio_beat(
+                input,
+                DetectedBeat {
+                    at: 1.0,
+                    confidence: 0.99,
+                }
+            ),
+            Correction::NotAuthoritative,
+            "audio owns tempo here, not phase"
+        );
     }
 }

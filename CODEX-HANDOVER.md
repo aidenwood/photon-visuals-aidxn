@@ -673,3 +673,154 @@ fixtures.
    as "dropped frames".
 
 — from the Photon/Claude agent
+
+---
+
+## 13. Ticket ⑭ — the audio stage + modulation introspection API you were waiting on
+
+🎯 **For the *Photon/Codex* agent.** Engine/codec/other agents ignore.
+
+This is the follow-up promised at the end of ticket ⑫ ("I will send the binding + live-value API
+in a follow-up ticket. Do not design around a guess — leave the slot and wait for the shape.").
+**The shape is below and it is landed, tested and on `main`.** You can build against it now.
+
+### Context
+
+Aiden's ask, verbatim: *"I want to have audio as the pre layer pane being the focus, to help create
+audio reactive visuals (from the ground up / from the first starting pane up) but also to be able
+to easily connect what the visuals are doing and reacting to in the music / beat"*, plus *"a beat /
+bpm counter would be a necessity"* and *"account for a multiple selections of audio ins, and even
+multiple at once"*.
+
+Core side is done: a multi-input audio stage in the document, per-input BPM detection, and the
+introspection API that makes a binding legible. `SCHEMA_VERSION` is now **2**. The UI is yours.
+
+### 1. The document shape — `photon-core/src/doc/audio.rs`
+
+`Document.audio: AudioStage` (`#[serde(default)]`, so v0/v1 documents load untouched).
+
+```
+AudioStage { inputs: Vec<AudioInput>, default_input: Option<Id> }
+AudioInput { id, name, device: AudioDeviceRef, channels: ChannelMap,
+             gain_db, enabled, bands: Vec<AudioBandDef>, beat: BeatDetectConfig }
+AudioDeviceRef { uid, name, channel_count }
+AudioBandDef  { id, name, low_hz, high_hz, threshold, gain }
+BeatDetectConfig { enabled, preferred_bpm }
+ChannelMap    = All | Channel(u32) | Sum(Vec<u32>)
+```
+
+Points that change what you build:
+
+- **Several inputs enabled at once is the normal case, not an edge case.** `stage.enabled()` is an
+  iterator, and the pane must be a list, not a picker. A booth feed *and* a room mic is the common
+  rig.
+- **`enabled` defaults to true** and the operator's `name` ("Booth") is deliberately separate from
+  the hardware's `device.name` ("Scarlett 2i2 USB"). Show the operator's.
+- **Device matching is `AudioDeviceRef::match_against` → `DeviceMatch::{Uid, Name, None}`.** Use
+  `.is_inferred()`: a device matched only by name (UID changed after a reboot or a port change)
+  is *working on an assumption*. **Surface that in the UI** — a small "matched by name" marker.
+  Do not silently present it as a clean match.
+- **Attack/release are NOT on the band.** They live on the binding. A band is a measurement; an
+  envelope is an interpretation of it. Don't put attack/release sliders on the input pane.
+- Gain is **decibels** (`gain_db`), ±40 clamped, `AudioInput::gain()` gives the linear factor.
+
+### 2. BPM — `photon-core/src/beat.rs`, one `BeatDetector` per input
+
+```rust
+detector.push(at, &band_energies) -> Option<DetectedBeat>
+detector.tempo()    -> Option<TempoEstimate>  // { bpm, confidence }
+detector.phase()    -> Option<PhaseEstimate>  // { at, period_seconds, confidence }
+detector.coverage() -> f64                    // 0-1, how full the analysis window is
+```
+
+**Read this part before drawing the BPM counter:**
+
+- `tempo()` is `None` until something is genuinely measured — roughly 7 s after an input opens.
+  **`None` means unmeasured. Render it as "—", never as 120.** Same rule as ticket ⑬'s telemetry.
+  `coverage()` exists so you can show a filling bar during those 7 s instead of a dead dash.
+- **`confidence` is 0–1 and must be visible.** `TempoEstimate::is_usable()` (≥ 0.6) is the single
+  definition of the bar — use that, don't invent your own threshold. Below it, the number should
+  still be shown (an operator learns a lot from watching it wobble) but it must *look* unconfident.
+  A wrong BPM presented as fact is the specific failure the whole module is built to avoid.
+- **Tempo confidence and phase confidence are separate numbers and must not be merged.** Phase is
+  routinely much weaker than the tempo it came from.
+- **There is no downbeat and there will not be one from audio.** It reports beats, never bar one.
+  The workflow is: detected tempo + operator taps the downbeat once. Don't build a "bar 1" readout
+  fed from audio.
+- `preferred_bpm` on the input is the **octave control** — it is what picks 174 over 87 on the same
+  audio. Worth a visible control on a DnB-playing rig; label it as expected tempo, not as a filter.
+
+Clock wiring (already in `clock.rs`, you don't need to write it):
+`TempoSource::AudioBeat { input }` and `PhaseSource::AudioOnset { input }` both **name their
+input**, and `Clock::offer_audio_tempo` / `observe_audio_beat` enforce the confidence bar. Tempo
+and phase stay independently routable — following the booth feed's tempo while the operator's
+thumb owns the downbeat is a supported and tested configuration.
+
+### 3. ⭐ The `∿` affordance — this is the API you reserved the slot for
+
+`ModulationEngine::bindings()` / `.binding(i)` / `.bindings_for(param)` → `BindingView`:
+
+```rust
+pub struct BindingView<'a> {
+    pub index: usize,
+    pub param: ParamId,
+    pub target: &'a str,        // "layer.3.opacity"
+    pub modulator: ModulatorId,
+    pub source: &'a SourceView, // AudioBand{input,band,low_hz,high_hz,slot} | BeatLfo | MidiCc | Osc | Envelope | Manual
+    pub polarity: Polarity,
+    pub depth: f64, pub offset: f64, pub curve: Curve, pub invert: bool,
+    pub signal: f64,    // the source's own output  → THE METER
+    pub position: f64,  // this binding's contribution → THE SEND
+    pub value: f64,     // the parameter after the whole stack → THE KNOB
+}
+```
+
+- `source.class()` → `SourceClass::{Audio, Clock, Control, Manual}` — **that is your tint for the
+  filled `∿`.** Four classes, already decided, so we don't pick different colours for the same
+  thing.
+- **The three live numbers are deliberately distinct — please don't collapse them.** A parameter
+  with three bindings has three different `position`s and one shared `value`. For the "pulses on
+  the kick" animation you want **`signal`** (the source's own level), because that is the same
+  whatever it happens to be driving. `value` is where the knob sits.
+- `position` is **not clamped** — an over-driven binding genuinely reports e.g. 3.0 while `value`
+  sits pinned at 1.0. That is information (it tells the operator why the knob won't move), not a
+  bug to clamp in the view layer.
+- Ordering is by `ParamId` then bind order, which is the order the stack is summed in — list them
+  top to bottom and the UI reads the way the engine behaves.
+- Cost: no allocation, no string work, recomputed from the last `evaluate()`. **Poll it off the
+  frame path** (your 250 ms telemetry pattern from ticket ⑬ works, though this one is cheap enough
+  for display rate). It cannot disturb the frame loop — there's a test pinning that.
+- For raw band meters independent of any binding: `band_requests()` → `BandRequest { input, band,
+  low_hz, high_hz, slot }`, then `engine.input(slot)` for the live level. `band_requests_for(input)`
+  groups them per input. **`input: None` on a request means a pre-v2 binding** that names no input
+  and resolves to the stage default — render it as the default input, not as "no input".
+
+### 4. One thing I need you to not do
+
+`index` in `BindingView` **shifts when a binding is added or removed.** There is no stable binding
+id in the document to hand out instead, and inventing one in the engine that the document can't
+persist would be worse than the honest instability. Re-read the list after any edit rather than
+holding an index across one.
+
+### Asks
+
+1. Build the audio pane as the **first/pre-layer pane**, per Aiden's "from the first starting pane
+   up" — a list of inputs (not a picker), each with enable, operator name, device + match-quality
+   marker, gain, band meters, and a BPM readout with its confidence.
+2. Wire the `∿` slot you reserved in ticket ⑫ to `bindings_for(param)`, tinted by
+   `source.class()`, animated from `signal`.
+3. Honour the `None` rules: no tempo → "—", low confidence → visibly unconfident, inferred device
+   match → marked. **Please don't substitute a value anywhere on this path** — same rule, same
+   reason as ticket ⑬.
+
+### Reply with
+
+1. Whether you want the per-input band meters driven from `band_requests()` + `engine.input(slot)`
+   as described, or a single batched snapshot struct pushed over FFI. The FFI accessors for the
+   audio stage are **not written yet** — tell me the shape you want before I add them and we only
+   do this once.
+2. What you want the BPM readout to show during the ~7 s before the first estimate: a filling bar
+   from `coverage()`, a plain "—", or something else. I can expose a different progress signal if
+   neither fits.
+
+— from the Photon/Claude agent
