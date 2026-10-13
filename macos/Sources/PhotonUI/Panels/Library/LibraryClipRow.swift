@@ -7,17 +7,17 @@ struct LibraryClipRow: View {
 
     var body: some View {
         Button(action: select) {
-            HStack(spacing: 10) {
+            HStack(spacing: 6) {
                 Image(systemName: "film")
                     .font(.system(size: 11)).foregroundStyle(selected ? PhotonTheme.accent : PhotonTheme.faint)
-                VStack(alignment: .leading, spacing: 4) {
+                VStack(alignment: .leading, spacing: 1) {
                     Text(clip.title).font(.system(size: 11, weight: selected ? .medium : .regular))
                     Text(clip.detail).font(.system(size: 9)).foregroundStyle(PhotonTheme.faint)
                 }
                 Spacer(minLength: 0)
             }
-            .padding(9)
-            .background(selected ? PhotonTheme.raised : .clear, in: RoundedRectangle(cornerRadius: 6))
+            .padding(PhotonTheme.contentInset)
+            .background(selected ? PhotonTheme.raised : .clear, in: Rectangle())
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)

@@ -1,40 +1,39 @@
 import SwiftUI
 
 struct MappingOverlay: View {
+    @Binding var quad: MappingQuad
+    @State private var dragOrigin: SIMD2<Double>?
+    private let labels = ["Top left", "Top right", "Bottom right", "Bottom left"]
+
     var body: some View {
         GeometryReader { geometry in
-            let rect = CGRect(
-                x: geometry.size.width * 0.08, y: geometry.size.height * 0.08,
-                width: geometry.size.width * 0.84, height: geometry.size.height * 0.84
-            )
+            let points = quad.corners.map { CGPoint(x: $0.x * geometry.size.width, y: $0.y * geometry.size.height) }
             Path { path in
-                path.addRect(rect)
-                for index in 1...3 {
-                    let x = rect.minX + rect.width * CGFloat(index) / 4
-                    let y = rect.minY + rect.height * CGFloat(index) / 4
-                    path.move(to: CGPoint(x: x, y: rect.minY))
-                    path.addLine(to: CGPoint(x: x, y: rect.maxY))
-                    path.move(to: CGPoint(x: rect.minX, y: y))
-                    path.addLine(to: CGPoint(x: rect.maxX, y: y))
-                }
+                path.move(to: points[0])
+                for point in points.dropFirst() { path.addLine(to: point) }
+                path.closeSubpath()
             }
-            .stroke(PhotonTheme.accent.opacity(0.75), style: StrokeStyle(lineWidth: 1, dash: [4, 4]))
+            .stroke(PhotonTheme.accent, style: StrokeStyle(lineWidth: 1, dash: [4, 3]))
+            .allowsHitTesting(false)
+
             ForEach(0..<4) { corner in
-                RoundedRectangle(cornerRadius: 2)
+                Rectangle()
                     .fill(PhotonTheme.accent)
-                    .frame(width: 9, height: 9)
-                    .position(
-                        x: corner.isMultiple(of: 2) ? rect.minX : rect.maxX,
-                        y: corner < 2 ? rect.minY : rect.maxY
-                    )
+                    .frame(width: 8, height: 8)
+                    .frame(width: 24, height: 24)
+                    .contentShape(Rectangle())
+                    .position(points[corner])
+                    .gesture(DragGesture(minimumDistance: 0).onChanged { drag in
+                        if dragOrigin == nil { dragOrigin = quad.corners[corner] }
+                        guard let origin = dragOrigin, geometry.size.width > 0, geometry.size.height > 0 else { return }
+                        let delta = SIMD2<Double>(drag.translation.width / geometry.size.width,
+                                                  drag.translation.height / geometry.size.height)
+                        quad = quad.moving(corner, to: origin + delta)
+                    }.onEnded { _ in dragOrigin = nil })
+                    .help("Drag \(labels[corner].lowercased()) corner")
+                    .accessibilityLabel("\(labels[corner]) slice corner")
+                    .accessibilityValue("X \(Int(quad.corners[corner].x * 100))%, Y \(Int(quad.corners[corner].y * 100))%")
             }
-            Text("SLICE 01")
-                .font(.system(size: 9, weight: .semibold)).tracking(1)
-                .padding(6)
-                .background(PhotonTheme.accent, in: RoundedRectangle(cornerRadius: 3))
-                .position(x: rect.minX + 40, y: rect.minY - 14)
         }
-        .accessibilityLabel("Preview mapping grid, slice one")
-        .allowsHitTesting(false)
     }
 }

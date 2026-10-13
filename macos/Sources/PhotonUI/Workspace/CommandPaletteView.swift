@@ -34,7 +34,7 @@ struct CommandPaletteView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack(spacing: 12) {
+            HStack(spacing: 6) {
                 Image(systemName: "magnifyingglass").foregroundStyle(PhotonTheme.accent)
                 TextField("Find a command…", text: $query)
                     .textFieldStyle(.plain).focused($focused)
@@ -54,31 +54,30 @@ struct CommandPaletteView: View {
                 Button("Esc") { dismiss() }.buttonStyle(.plain).foregroundStyle(PhotonTheme.faint)
                     .keyboardShortcut(.cancelAction)
             }
-            .padding(20)
+            .padding(8)
             Divider().overlay(PhotonTheme.border)
             ScrollViewReader { proxy in
             ScrollView {
-                VStack(spacing: 4) {
+                VStack(spacing: 0) {
                     ForEach(Array(commands.enumerated()), id: \.element.0) { index, command in
                         let (title, symbol, action) = command
                         Button { action(); dismiss() } label: {
-                            HStack(spacing: 12) {
+                            HStack(spacing: 6) {
                                 Image(systemName: symbol).frame(width: 16).foregroundStyle(PhotonTheme.muted)
                                 Text(title)
                                 Spacer()
                                 Image(systemName: "return").foregroundStyle(PhotonTheme.faint)
                             }
-                            .padding(12).contentShape(Rectangle())
-                            .background(index == selectedIndex ? PhotonTheme.raised : .clear, in: RoundedRectangle(cornerRadius: 4))
+                            .padding(.horizontal, 6).frame(height: 26).contentShape(Rectangle())
+                            .background(index == selectedIndex ? PhotonTheme.raised : .clear, in: Rectangle())
                         }
                         .buttonStyle(.plain)
                         .id(index)
                     }
                     if commands.isEmpty {
-                        Text("No matching commands").foregroundStyle(PhotonTheme.muted).padding(24)
+                        Text("No matching commands").foregroundStyle(PhotonTheme.muted).padding(8)
                     }
                 }
-                .padding(10)
             }
             .onChange(of: selectedIndex) { _, index in proxy.scrollTo(index, anchor: .center) }
             }

@@ -8,9 +8,12 @@ import OSLog
 struct PhotonApp: App {
     @NSApplicationDelegateAdaptor(PhotonAppDelegate.self) private var delegate
     @State private var workspace: WorkspaceModel
+    private let mediaCatalog: LocalMediaCatalog
 
     init() {
-        let model = WorkspaceModel()
+        let catalog = LocalMediaCatalog()
+        mediaCatalog = catalog
+        let model = WorkspaceModel(provider: LocalMediaWorkspaceProvider(catalog: catalog), effectDefinitions: NativeEffectDefinitions.all)
         do {
             _ = try PhotonCoreABI.validate()
         } catch {
@@ -24,7 +27,9 @@ struct PhotonApp: App {
 
     var body: some Scene {
         Window("Photon", id: "workspace") {
-            PhotonWorkspace(model: workspace, programSurface: .engine())
+            PhotonWorkspace(model: workspace, programSurface: .engine(model: workspace), clipPoster: ClipPosterFactory { clip in
+                AnyView(LocalClipPoster(clip: clip, catalog: mediaCatalog))
+            })
         }
         .defaultSize(width: 1460, height: 960)
         .windowResizability(.contentMinSize)

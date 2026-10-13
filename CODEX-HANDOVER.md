@@ -598,3 +598,78 @@ gap. Point the provider at a real folder and the fixtures can go.
    which side owns ordering.
 
 — from the Photon/Claude agent
+
+---
+
+## 12. Ticket ⑬ — the CPU/GPU/Output readout is live; 3 lines of it are in your files
+
+🎯 **For the *Photon/Codex* agent.** Engine/other agents ignore.
+
+### Context
+Aiden noticed the corner readout wasn't monitoring anything. It wasn't: `PreviewWorkspaceProvider`
+returned `TelemetrySnapshot(nil, nil, nil)` — correctly honest, but nothing measured — and
+`WorkspaceModel.start()` loads that panel **once**, so even a real value would never have changed.
+Both halves are fixed. It now reads e.g. `CPU 0.3 ms · GPU 0.1 ms · Output 60.0 fps`, verified in
+the running app bundle.
+
+### What I added (engine + my files — nothing for you to do here)
+- `engine/Sources/PhotonRender/FrameMeter.swift` **(new)** — owns all frame timing.
+  - **GPU ms** — `gpuEndTime - gpuStartTime`, read inside `addCompletedHandler` only.
+  - **CPU ms** — the engine's own frame build, `clock_gettime_nsec_np(CLOCK_UPTIME_RAW)`.
+  - **Output FPS** — intervals between `MTLDrawable.presentedTime` values. Not the render-call
+    rate: on this M4 Max the engine renders at 120 Hz into a 60 Hz present, so a render-call
+    counter would have reported **double the truth** and looked entirely plausible doing it.
+  - Rolling average over **60 frames** (1 s at 60 Hz) — stated and justified in the doc comment.
+  - Render thread never waits: cross-thread state is read with `withLockIfAvailable`, and on
+    contention the frame reuses the previous numbers rather than blocking.
+- `EngineTelemetry` timing fields are now **`Double?`**. `fps` → `outputFPS`, plus `cpuTime`.
+  `nil` means "not measured", never 0. If you were reading `telemetry.fps` or `telemetry.gpuTime`
+  as `Double`, that is the one source break — it is deliberate.
+- `EngineTelemetry.unpresentedFrames` — composited frames the display never showed, observed from
+  `presentedTime == 0`. **Not a dropped-frame count**; rendering above the refresh rate produces
+  these by design. Honours the "a counter that cannot observe a condition must not report zero"
+  rule: it only counts what it can actually see.
+- `Compositor.lastGPUTime` and `Compositor.noteCompletion(_:)` are **gone** — one owner for GPU
+  time instead of two. `Compositor.meter` replaces them.
+- `macos/Sources/PhotonRenderSurface/ProgramMetalView.swift` — the **master** surface polls
+  `engine.telemetry` every 250 ms off the frame path and publishes. A clip preview deliberately
+  does not: its frame cost is not the program's.
+- `macos/Sources/PhotonUI/Services/LiveTelemetryBus.swift` **(new file, additive)** — the drop box
+  between the two modules, plus a `.liveTelemetryRefresh(model)` view modifier. Carries
+  measurements only; goes blank after 1 s with no publisher rather than freezing a stale number.
+
+### Asks — 3 lines total, all already applied; please keep them through your in-flight work
+1. `macos/Sources/PhotonApp/LocalMediaWorkspaceProvider.swift` — `telemetry()` now returns
+   `LiveTelemetryBus.shared.current` instead of delegating to the editor fixture. The fixture has
+   no renderer and should keep reporting every metric as unknown; don't route this back through it.
+2. `macos/Sources/PhotonUI/Panels/Telemetry/PerformanceBar.swift` — one added modifier,
+   `.liveTelemetryRefresh(model)`, under the existing `.frame(width: 250, ...)`. Without it the
+   panel loads once and the numbers never move again.
+3. **Please don't substitute a value anywhere on this path.** Not a target rate, not a
+   last-known-good, not 0. `TelemetryReadout` already renders `nil` as "—" and that is correct and
+   intended — a blank is the only version that makes someone go and look.
+
+I touched nothing else in `PhotonUI`/`PhotonApp`: no restyling, no re-layout, no renames, no clip
+fixtures.
+
+### ⚠️ Two things I did not touch, flagged rather than fixed
+- At ~19:45 `macos` did not build from your working tree: `WorkspaceModel+EffectMirror.swift`
+  (untracked) referenced `renderEffects` / `renderEffectsRequest`, which `WorkspaceModel` did not
+  yet declare. You resolved it while I was working — by 20:00 the full package built clean. Noting
+  it only so you know I compiled against a moving tree and verified afterwards, not before.
+- `PhotonVerify` dipped to **209/211** mid-session: `every effect is an identity at its neutral
+  amount` (Temperature) and `every labelled param knob actually does something` (29 inert knobs),
+  both from the effects work landing in `engine/Sources/PhotonRender/EffectChain.swift`
+  concurrently, neither mine. Both were green again by 20:05 — **final state is 211/211**.
+  Recorded rather than quietly deleted, so nobody re-derives whether telemetry caused it.
+  Baseline before my change was 180/180; I added 21 checks, the effects work added 10.
+
+### Reply with
+1. Confirmation you've kept asks 1 and 2 through your inspector/effects branch — they are the only
+   two lines of mine in files you own, and a merge that drops either one silently returns the
+   readout to "—" with no error anywhere.
+2. Whether you want `unpresentedFrames` surfaced in the UI. It is measured and live now; I have
+   not put it on screen because I don't own that layout, and it needs a label that does not read
+   as "dropped frames".
+
+— from the Photon/Claude agent

@@ -52,6 +52,7 @@ final class WorkspaceCommandQueue {
 
 private enum ContinuousControl: Equatable {
     case clipOpacity(String), layerOpacity(String), masterOpacity
+    case effect(InspectorEffectScope, String, EffectParameter)
 }
 
 private extension WorkspaceAction {
@@ -60,6 +61,7 @@ private extension WorkspaceAction {
         case let .setOpacity(id, _): .clipOpacity(id)
         case let .setLayerOpacity(id, _): .layerOpacity(id)
         case .setMasterOpacity: .masterOpacity
+        case let .setEffectParameter(scope, id, parameter, _): .effect(scope, id, parameter)
         default: nil
         }
     }

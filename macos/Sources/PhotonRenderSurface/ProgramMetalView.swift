@@ -12,6 +12,7 @@ import AppKit
 import Metal
 import QuartzCore
 import PhotonRender
+import PhotonUI
 import simd
 
 /// Which composition this surface shows.
@@ -28,11 +29,17 @@ public final class ProgramMetalView: NSView {
     private let engine: PhotonEngine
     private let role: SurfaceRole
     private var link: CAMetalDisplayLink?
-    private var mediaLoad: Task<Void, Never>?
+    private var applied: SurfacePlan?
+    private var publishing: Task<Void, Never>?
     private var metalLayer: CAMetalLayer { layer as! CAMetalLayer }
 
     /// Live telemetry for a stats panel.
     public var telemetry: EngineTelemetry { engine.telemetry }
+
+    /// How often measured timings are handed to the readout. Matches the
+    /// engine's own republish interval — polling faster would re-read numbers
+    /// it has not recalculated.
+    private static let publishInterval = Duration.milliseconds(250)
 
     public static func make(role: SurfaceRole) -> ProgramMetalView? {
         guard let d = MTLCreateSystemDefaultDevice(),
@@ -49,9 +56,8 @@ public final class ProgramMetalView: NSView {
         // Must come from makeBackingLayer(); assigning `layer` after
         // `wantsLayer = true` is not honoured by AppKit.
         wantsLayer = true
-        // Present immediately. Desktop/iCloud directory access can block in
-        // open(2); it must never run during SwiftUI's makeNSView/layout pass.
-        loadDefaultComposition(urls: [])
+        // Present immediately with an empty stack. The composition arrives from
+        // the workspace via `apply(_:)`; nothing is loaded speculatively here.
         startLink()
     }
 
@@ -86,13 +92,58 @@ public final class ProgramMetalView: NSView {
             // preview panel holds no display-link registration at all.
             link?.invalidate()
             link = nil
-            mediaLoad?.cancel()
-            mediaLoad = nil
+            // And blank the readout. Numbers from a renderer that has stopped
+            // are not measurements of anything.
+            stopPublishing()
         } else {
             startLink()
-            loadDevelopmentMedia()
+            startPublishing()
         }
         updateDrawableSize()
+    }
+
+    // MARK: - Telemetry publishing
+
+    /// Starts handing the engine's measured timings to the corner readout.
+    ///
+    /// Only the **master** surface publishes. A clip preview renders a single
+    /// pre-composite source on its own engine, so its frame cost is not the
+    /// program's — showing it under a label that says "Output" would be a
+    /// measurement of the wrong thing, which is the same failure as inventing
+    /// one. The bus enforces a single owner, so a second master surface is
+    /// refused rather than interleaved.
+    ///
+    /// Reads `engine.telemetry` from the main actor. That is safe *because*
+    /// the display link is added to the main run loop, so the render callback
+    /// that writes it and this task that reads it are the same thread — the
+    /// struct can never be torn. If the link is ever moved to its own thread,
+    /// this read needs revisiting; nothing else here does.
+    ///
+    /// This is deliberately a poll off the frame path rather than a push from
+    /// `render`: the render thread must never take the bus's lock.
+    private func startPublishing() {
+        guard role == .master, publishing == nil,
+              LiveTelemetryBus.shared.claim(self) else { return }
+        publishing = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                do { try await Task.sleep(for: ProgramMetalView.publishInterval) } catch { return }
+                guard let self, self.window != nil else { return }
+                let t = self.engine.telemetry
+                // Passed straight through. A metric the engine could not
+                // measure stays nil all the way to the readout's "—".
+                LiveTelemetryBus.shared.publish(
+                    TelemetrySnapshot(cpuMilliseconds: t.cpuTime,
+                                      gpuMilliseconds: t.gpuTime,
+                                      outputFPS: t.outputFPS),
+                    from: self)
+            }
+        }
+    }
+
+    private func stopPublishing() {
+        publishing?.cancel()
+        publishing = nil
+        LiveTelemetryBus.shared.release(self)
     }
 
     public override func setFrameSize(_ newSize: NSSize) {
@@ -113,59 +164,58 @@ public final class ProgramMetalView: NSView {
         if metalLayer.drawableSize != size { metalLayer.drawableSize = size }
     }
 
-    // MARK: - Default composition
+    // MARK: - Composition
 
-    /// Media shipped alongside the repo for development. Absent in a packaged
-    /// build, in which case the engine falls back to procedural layers — the
-    /// preview must always show *something* rather than going black.
-    nonisolated private static func mediaURLs() -> [URL] {
-        let staged = Bundle.main.resourceURL?.appendingPathComponent("DevelopmentMedia")
-        let checkout = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()   // .../Sources/PhotonRenderSurface
-            .deletingLastPathComponent()   // .../Sources
-            .deletingLastPathComponent()   // .../macos
-            .deletingLastPathComponent()   // repo root
-            .appendingPathComponent("media-cache")
-        let base = staged ?? checkout
-        guard let names = try? FileManager.default
-            .contentsOfDirectory(atPath: base.path) else { return [] }
-        return names.filter { $0.hasSuffix(".mp4") }
-            .sorted()
-            .map { base.appendingPathComponent($0) }
-    }
-
-    private func loadDevelopmentMedia() {
-        guard mediaLoad == nil else { return }
-        mediaLoad = Task { [weak self] in
-            let urls = await Self.developmentMedia.value
-            guard !Task.isCancelled, let self, self.window != nil, !urls.isEmpty else { return }
-            self.loadDefaultComposition(urls: urls)
+    /// The inspector's blend names, as the engine knows them. An unrecognised
+    /// name falls back to `.over` rather than to a different-looking blend.
+    private static func blend(_ name: String) -> BlendMode {
+        switch name {
+        case "Add": return .add
+        case "Multiply": return .multiply
+        case "Screen": return .screen
+        default: return .over
         }
     }
 
-    // One bounded development scan shared by both monitors, including remounts.
-    // Named explicitly rather than via `Self`: a static stored-property
-    // initializer cannot reference the covariant `Self` type.
-    nonisolated private static let developmentMedia =
-        Task.detached(priority: .utility) { ProgramMetalView.mediaURLs() }
-
-    private func loadDefaultComposition(urls: [URL]) {
-        // Master composites a stack; a clip preview is pre-composite by
-        // definition, so it shows a single source.
-        let wanted = role == .master ? min(urls.count, 3) : min(urls.count, 1)
-        let blends: [BlendMode] = [.over, .screen, .add, .lighten]
-
-        let states = (0..<max(wanted, 1)).map { i in
+    /// Applies the workspace's composition to this surface.
+    ///
+    /// This is the whole point of the view: what a grid trigger launches is
+    /// what this renders. It previously loaded whatever media sat in the repo,
+    /// ignoring the workspace entirely, so selection could never reach output.
+    ///
+    /// An unchanged plan is ignored. `setLayers` only keeps a source whose URL
+    /// is identical, so re-applying on every unrelated SwiftUI update would
+    /// restart playback on each one.
+    func apply(_ plan: SurfacePlan) {
+        guard applied != plan else { return }
+        applied = plan
+        engine.masterOpacity = Float(plan.masterOpacity)
+        engine.blackout = plan.blackout
+        // Index is the stable layer identity here: the plan always carries the
+        // full stack in draw order, so a bypassed or cleared layer keeps its
+        // slot and its neighbours keep their already-open sources.
+        engine.setLayers(plan.layers.enumerated().map { index, layer in
             LayerState(
-                id: i,
-                name: i < urls.count
-                    ? urls[i].deletingPathExtension().lastPathComponent
-                    : "Layer \(i + 1)",
-                opacity: i == 0 ? 1.0 : 0.8,
-                blend: blends[i % blends.count],
-                clipURL: i < wanted ? urls[i] : nil)
+                id: index,
+                name: layer.name,
+                opacity: Float(layer.opacity),
+                blend: Self.blend(layer.blendMode),
+                bypassed: layer.bypassed,
+                soloed: layer.soloed,
+                clipURL: layer.url,
+                effects: Self.chain(layer.effects))
+        })
+    }
+
+    /// An unrecognised kind is dropped, not substituted. A chain that silently
+    /// ran the wrong effect would be worse than one that ran one fewer.
+    private static func chain(_ effects: [SurfacePlan.Effect]) -> [Effect] {
+        effects.compactMap { effect in
+            EffectKind(rawValue: effect.kind).map {
+                Effect(kind: $0, amount: Float(effect.amount),
+                       param: Float(effect.param), enabled: effect.enabled)
+            }
         }
-        engine.setLayers(states)
     }
 
     // MARK: - Commands (for the UI to drive later)
@@ -173,6 +223,14 @@ public final class ProgramMetalView: NSView {
     public func setOpacity(layer id: Int, _ v: Float) { engine.setOpacity(layer: id, v) }
     public func setBlend(layer id: Int, _ m: BlendMode) { engine.setBlend(layer: id, m) }
     public func setBlackout(_ on: Bool) { engine.blackout = on }
+    /// Presentation bridge for the editor's current preview slice. Engine owns warping.
+    public func setMappingCorners(_ normalized: [SIMD2<Double>]) {
+        guard normalized.count == 4, normalized.allSatisfy({ $0.x.isFinite && $0.y.isFinite }),
+              !engine.topology.screens.isEmpty, !engine.topology.screens[0].slices.isEmpty else { return }
+        let corners = normalized.map { SIMD2<Float>(Float($0.x * 2 - 1), Float(1 - $0.y * 2)) }
+        guard engine.topology.screens[0].slices[0].corners != corners else { return }
+        engine.topology.screens[0].slices[0].corners = corners
+    }
     public var layers: [LayerState] { engine.layers }
 }
 

@@ -9,8 +9,8 @@ struct IconButton: View {
         Button(action: action) {
             Image(systemName: symbol)
                 .font(.system(size: 12))
-                .frame(width: 28, height: 28)
-                .background(PhotonTheme.raised, in: RoundedRectangle(cornerRadius: 6))
+                .frame(width: PhotonTheme.controlHeight, height: PhotonTheme.controlHeight)
+                .background(PhotonTheme.raised, in: Rectangle())
         }
         .buttonStyle(.plain)
         .foregroundStyle(PhotonTheme.muted)

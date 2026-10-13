@@ -16,7 +16,7 @@ struct LiveFader: View {
     }
 
     var body: some View {
-        HStack(spacing: 8) {
+        HStack(spacing: 4) {
             Slider(value: $draft, in: 0...1) { active in
                 editing = active
                 if !active { flush() }

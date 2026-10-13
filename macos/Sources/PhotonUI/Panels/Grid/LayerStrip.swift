@@ -6,13 +6,13 @@ struct LayerStrip: View {
     let rowHeight: CGFloat
 
     var body: some View {
-        VStack(spacing: 2) {
+        VStack(spacing: PhotonTheme.panelGap) {
             HStack {
                 Text("Layers").font(.system(size: 10, weight: .medium))
                 Spacer()
                 Text("Opacity / Blend").font(.system(size: 9)).foregroundStyle(PhotonTheme.faint)
             }
-            .padding(.horizontal, 10).frame(height: 26)
+            .padding(.horizontal, PhotonTheme.contentInset).frame(height: PhotonTheme.panelHeaderHeight)
             .background(PhotonTheme.raised)
             ForEach(layers) { layer in
                 LayerControlRow(
@@ -24,6 +24,7 @@ struct LayerStrip: View {
                     solo: { model.toggleLayerSolo(layer) }
                 )
                 .frame(height: rowHeight)
+                .effectDropTarget(model: model, scope: .layer(layer.id), label: layer.title)
             }
         }
     }

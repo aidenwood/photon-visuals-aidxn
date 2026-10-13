@@ -12,23 +12,24 @@ struct BrowserPanel: View {
                     scope = $0
                     query = ""
                 }
-                VStack(spacing: 8) {
+                VStack(spacing: 2) {
                 TextField(scope == .effects ? "Search effects" : "Search \(scope.rawValue.lowercased())", text: $query)
                     .textFieldStyle(.plain).font(.system(size: 11))
-                    .padding(8).background(PhotonTheme.background, in: RoundedRectangle(cornerRadius: 4))
+                    .padding(.horizontal, PhotonTheme.contentInset).frame(height: PhotonTheme.controlHeight)
+                    .background(PhotonTheme.background, in: Rectangle())
                 switch scope {
                 case .files: mediaList
-                case .effects: EffectsBrowser(query: query)
+                case .effects: EffectsBrowser(model: model, query: query)
                 case .sources:
                     PanelEmptyView(symbol: "waveform.path", title: "No sources connected", detail: "Generators and signal inputs will appear here.")
                 case .compositions:
-                    VStack(alignment: .leading, spacing: 6) {
+                    VStack(alignment: .leading, spacing: 4) {
                         Text("Afterlight").font(.system(size: 12, weight: .medium))
                         Text("Current preview composition").font(.system(size: 10)).foregroundStyle(PhotonTheme.muted)
                         Spacer()
-                    }.padding(8).frame(maxWidth: .infinity, alignment: .leading)
+                    }.padding(PhotonTheme.contentInset).frame(maxWidth: .infinity, alignment: .leading)
                 }
-                }.padding(10).frame(maxHeight: .infinity)
+                }.frame(maxHeight: .infinity)
             }
             .frame(maxHeight: .infinity)
         }
@@ -41,7 +42,7 @@ struct BrowserPanel: View {
                 PanelEmptyView(symbol: "magnifyingglass", title: "No matching media", detail: "Try a different search.")
             } else {
                 ScrollView {
-                    LazyVStack(spacing: 2) {
+                    LazyVStack(spacing: 0) {
                         ForEach(matches) { clip in
                             LibraryClipRow(clip: clip, selected: selectedAssetID == clip.id, select: { model.selectClip(clip.id) })
                         }

@@ -669,6 +669,170 @@ do {
     check("effect kind count matches the shader's case range",
           EffectKind.allCases.count == 35,
           "\(EffectKind.allCases.count) kinds — the shader switch covers 0...34")
+
+    // The neutral point of `amount`, asserted rather than assumed.
+    //
+    // An operator automates `amount` from a fader, an LFO or an envelope. If the
+    // neutral end of that modulation is not an exact identity the picture jumps
+    // the instant the source reaches rest — a jump that only appears once the
+    // modulation is wired up, which is to say on stage.
+    //
+    // `EffectKind.amountMode` declares where neutral sits; this proves the
+    // shader agrees. `param` is swept too, because a knob parked somewhere else
+    // must not reintroduce the effect behind a neutral `amount`.
+    // Returns the sampled grid rather than the texture. `EffectChain` ping-pongs
+    // through two pooled targets, so a one-effect chain always lands in the SAME
+    // texture — holding two "results" and comparing them compares one texture
+    // with itself, which silently passes everything. Read it out now or it is
+    // gone by the next call.
+    func probeGrid(_ kind: EffectKind, amount: Float, param: Float,
+                   beat: Double = 2.0) -> [Float] {
+        let cb = compositor.makeCommandBuffer()!
+        let out = chain.apply([Effect(kind: kind, amount: amount, param: param)],
+                              to: probe, in: cb, time: 0.37, beat: beat)
+        cb.commit(); cb.waitUntilCompleted()
+        var grid: [Float] = []
+        for gy in stride(from: SIZE / 8, to: SIZE, by: SIZE / 4) {
+            for gx in stride(from: SIZE / 8, to: SIZE, by: SIZE / 4) {
+                grid.append(contentsOf: rgba(out, gx, gy))
+            }
+        }
+        return grid
+    }
+
+    var probeBaseline: [Float] = []
+    for gy in stride(from: SIZE / 8, to: SIZE, by: SIZE / 4) {
+        for gx in stride(from: SIZE / 8, to: SIZE, by: SIZE / 4) {
+            probeBaseline.append(contentsOf: rgba(probe, gx, gy))
+        }
+    }
+
+    var notNeutral: [String] = []
+    for kind in EffectKind.allCases {
+        let neutral: Float = kind.amountMode == .bipolar ? 0.5 : 0.0
+        // `neutralParam` is non-nil only where the second knob is an independent
+        // axis rather than a setting the effect is gated over (temperature).
+        let params: [Float] = kind.neutralParam.map { [$0] } ?? [0.0, 0.35, 1.0]
+        var worst: Float = 0
+        for param in params {
+            let out = probeGrid(kind, amount: neutral, param: param)
+            for i in 0..<min(out.count, probeBaseline.count) {
+                worst = max(worst, abs(out[i] - probeBaseline[i]))
+            }
+        }
+        // 0.004 is two float16 ulps around 1.0 — tight enough that a real
+        // effect cannot hide under it, loose enough for a linear↔display
+        // round trip and a trig identity in the warps.
+        if worst > 0.004 { notNeutral.append("\(kind.name) (\(worst))") }
+    }
+    check("every effect is an identity at its neutral amount", notNeutral.isEmpty,
+          "these moved the picture while parked: \(notNeutral.joined(separator: ", "))")
+
+    // A `nil` paramLabel is a promise that the second knob does nothing. If the
+    // shader reads `param` anyway, the UI hides a control that is still live and
+    // the effect behaves differently depending on a value nobody can see.
+    var lyingLabels: [String] = []
+    for kind in EffectKind.allCases where kind.paramLabel == nil {
+        let lo = probeGrid(kind, amount: 0.8, param: 0.0)
+        let hi = probeGrid(kind, amount: 0.8, param: 1.0)
+        if zip(lo, hi).contains(where: { abs($0 - $1) > 0.002 }) {
+            lyingLabels.append(kind.name)
+        }
+    }
+    check("effects with no param label genuinely ignore param", lyingLabels.isEmpty,
+          "these read param behind an unlabelled knob: \(lyingLabels.joined(separator: ", "))")
+
+    // The converse: a labelled knob that does nothing is a knob the operator
+    // turns during a show while wondering why the screen is not changing.
+    var deadParams: [String] = []
+    for kind in EffectKind.allCases where kind.paramLabel != nil {
+        // Not at amount 0 — a correct effect is an identity there whatever
+        // param says, so param can only be observed with the effect engaged.
+        // Two musical positions, because a tempo-locked effect can legitimately
+        // sit in the same state for two different rates at one instant — a
+        // strobe that happens to be dark at both reads as a dead knob when it
+        // is simply mid-blackout.
+        var live = false
+        for beat in [0.3, 2.0] {
+            let lo = probeGrid(kind, amount: 0.7, param: 0.1, beat: beat)
+            let hi = probeGrid(kind, amount: 0.7, param: 0.9, beat: beat)
+            if zip(lo, hi).contains(where: { abs($0 - $1) > 0.002 }) { live = true }
+        }
+        if !live { deadParams.append("\(kind.name)/\(kind.paramLabel!)") }
+    }
+    check("every labelled param knob actually does something", deadParams.isEmpty,
+          "these knobs are labelled but inert: \(deadParams.joined(separator: ", "))")
+
+    // A NaN in a live show poisons every pixel it touches for the rest of the
+    // frame, and no amount of staring at the wall tells you which effect did it.
+    // Sweep both knobs to the ends of their ranges, where the divisions and the
+    // pow()s live, and refuse to ship anything non-finite.
+    var nonFinite: [String] = []
+    for kind in EffectKind.allCases {
+        outer: for amount in [Float(0.0), 0.5, 1.0] {
+            for param in [Float(0.0), 0.5, 1.0] {
+                if probeGrid(kind, amount: amount, param: param)
+                    .contains(where: { !$0.isFinite }) {
+                    nonFinite.append("\(kind.name) @ \(amount)/\(param)")
+                    break outer
+                }
+            }
+        }
+    }
+    check("no effect produces NaN or infinity at the ends of its range",
+          nonFinite.isEmpty, "non-finite output from: \(nonFinite.joined(separator: ", "))")
+}
+
+
+// 14b. Blend modes — the other enum that hand-mirrors `photon-core`.
+//
+// Same class of defect as the effect-kind check above, and it has already bitten
+// once: the Swift enum lost `Subtract`, so every mode above it shifted by one
+// (a show saved as Subtract rendered as Lighten) and `Darken` — raw value 10 —
+// fell off the end of the ten-element name array and crashed on open. Nothing
+// at build time compares these two enums across the language boundary, so the
+// test has to be the compiler.
+print("\nblend modes:")
+do {
+    let modes = BlendMode.allCases
+    let countOK = modes.count == 11
+    check("blend mode count matches photon-core", countOK,
+          "\(modes.count) cases — photon-core defines 11")
+
+    check("blend mode raw values are contiguous from zero",
+          modes.map(\.rawValue) == Array(Int32(0)...Int32(10)),
+          "got \(modes.map(\.rawValue))")
+
+    check("the last blend mode is constructible from its raw value",
+          BlendMode(rawValue: 10) != nil,
+          "rawValue 10 has no case — the enum is short of photon-core")
+
+    // `.name` indexes a literal array, so a case past its end traps rather than
+    // returning nil. Only reachable once the count is known good; checking it
+    // blind would crash the verifier instead of reporting the fault.
+    if countOK {
+        let names = modes.map(\.name)
+        check("every blend mode has a non-empty name",
+              names.allSatisfy { !$0.isEmpty } && Set(names).count == names.count,
+              "names: \(names)")
+        check("blend mode names are in raw-value order",
+              names == ["Over", "Add", "Multiply", "Screen", "Difference", "Mask",
+                        "Overlay", "Hard Light", "Subtract", "Lighten", "Darken"],
+              "names: \(names) — a shifted name means a show file renders as the wrong mode")
+    } else {
+        check("every blend mode has a non-empty name", false,
+              "skipped — the count is wrong, reading .name would trap")
+        check("blend mode names are in raw-value order", false, "skipped")
+    }
+
+    // `needsDestination` has no `default`, so the compiler already catches a
+    // missing case. What it cannot catch is a case moving to the wrong side,
+    // which silently drops the whole stack out of the folded path (or worse,
+    // keeps it in when a mode needs to read what is underneath).
+    let reads = Set(modes.filter(\.needsDestination).map(\.name))
+    check("the modes that must read the destination are exactly the five that do",
+          reads == ["Difference", "Mask", "Overlay", "Hard Light", "Subtract"],
+          "got \(reads.sorted())")
 }
 
 
@@ -1415,6 +1579,112 @@ do {
     check("a zero frame delta freezes the envelope rather than snapping it",
           frozen.levels[0] <= wide.levels[0] + 1e-6,
           "\(wide.levels[0]) -> \(frozen.levels[0])")
+}
+
+// 28. Telemetry maths — the readout is only as honest as this arithmetic.
+//
+// No GPU dependency: these exercise the rolling window and the "unavailable"
+// states, which is where a telemetry bug hides. A wrong mean still looks like
+// a measurement, so it has to be asserted on rather than eyeballed in a HUD.
+print("\nTelemetry maths:")
+do {
+    var ring = FrameRing(capacity: 4)
+    check("an unmeasured window reports nil, not zero", ring.average == nil)
+    check("a percentile of nothing is nil, not zero",
+          ring.percentile(0.5, minimumSamples: 1) == nil)
+
+    for v in [1.0, 2.0, 3.0] { ring.append(v) }
+    check("a partial window averages what it actually has",
+          ring.average.map { abs($0 - 2.0) < 1e-12 } == true, "got \(ring.average as Any)")
+
+    // Past capacity the oldest sample must leave, or the "rolling" average is
+    // really a lifetime average and stops responding to anything.
+    for v in [4.0, 5.0, 6.0, 7.0, 8.0] { ring.append(v) }
+    check("the window is bounded by its capacity", ring.count == 4, "got \(ring.count)")
+    check("old samples fall out of the rolling average",
+          ring.average.map { abs($0 - 6.5) < 1e-12 } == true, "got \(ring.average as Any)")
+
+    // The incremental sum is recomputed on each wrap. Without that, a long
+    // show accumulates float drift and the number slowly stops being true.
+    var long = FrameRing(capacity: FrameMeter.window)
+    for i in 1...10_000 { long.append(Double(i) * 0.1) }
+    let tail = (10_000 - FrameMeter.window + 1...10_000).map { Double($0) * 0.1 }
+    let expected = tail.reduce(0, +) / Double(tail.count)
+    check("the mean stays exact after thousands of wraps",
+          long.average.map { abs($0 - expected) < 1e-9 } == true,
+          "got \(long.average as Any) want \(expected)")
+
+    // A failed measurement must be discarded. Counted as zero it reports a
+    // frame that cost nothing; folded in raw it poisons the whole window.
+    var guarded = FrameRing(capacity: 4)
+    guarded.append(10)
+    guarded.append(.nan)
+    guarded.append(.infinity)
+    guarded.append(-5)
+    check("a non-finite or negative sample is discarded, not counted as zero",
+          guarded.count == 1 && guarded.average == 10, "got \(guarded.average as Any)")
+
+    var pct = FrameRing(capacity: 200)
+    for i in 1...100 { pct.append(Double(i)) }
+    check("a percentile below its sample floor is nil",
+          pct.percentile(0.99, minimumSamples: FrameMeter.percentileFloor + 1) == nil)
+    check("a percentile at its sample floor reports",
+          pct.percentile(0.50, minimumSamples: FrameMeter.percentileFloor) == 51)
+}
+
+do {
+    let m = FrameMeter()
+    let fresh = m.sample()
+    check("a meter that has seen nothing reports nothing",
+          fresh.cpuMilliseconds == nil && fresh.gpuMilliseconds == nil
+          && fresh.outputFPS == nil && fresh.frameIntervalP50 == nil
+          && fresh.frameIntervalP99 == nil)
+
+    // One frame gives a CPU cost but no interval — an interval needs two.
+    m.beginFrame()
+    m.endFrame()
+    let one = m.sample()
+    check("one frame yields a CPU time", one.cpuMilliseconds != nil)
+    check("a CPU time is finite and non-negative",
+          one.cpuMilliseconds.map { $0.isFinite && $0 >= 0 } == true,
+          "got \(one.cpuMilliseconds as Any)")
+    check("one frame is not enough for an interval", one.frameIntervalP50 == nil)
+
+    // Well short of the p99 floor: a median is available, a 1-in-100 figure is
+    // not, and the meter must say so rather than offer the worst of a short run.
+    for _ in 0..<(FrameMeter.percentileFloor / 4) {
+        m.beginFrame()
+        m.endFrame()
+    }
+    let few = m.sample()
+    check("repeated frames yield a median interval", few.frameIntervalP50 != nil)
+    check("a p99 is withheld until there are enough samples for one",
+          few.frameIntervalP99 == nil)
+
+    // Past the window size, so the ring is full regardless of how many
+    // same-nanosecond pairs this machine's clock granularity threw away.
+    for _ in 0..<(FrameMeter.percentileWindow * 4) {
+        m.beginFrame()
+        m.endFrame()
+    }
+    let many = m.sample()
+    check("a p99 appears once there are enough samples for one",
+          many.frameIntervalP99 != nil)
+    check("the p99 is no better than the median", (many.frameIntervalP99 ?? 0) >= (many.frameIntervalP50 ?? 0),
+          "p50 \(many.frameIntervalP50 as Any) p99 \(many.frameIntervalP99 as Any)")
+
+    // The two that cannot be observed off a display. These staying nil IS the
+    // feature: a CPU-only path must not invent a GPU cost or a refresh rate.
+    check("no completed command buffer means no GPU figure, not 0 ms",
+          many.gpuMilliseconds == nil)
+    check("nothing presented means no output FPS, not 0 fps", many.outputFPS == nil)
+    check("a run with no drawables counts no unpresented frames either",
+          m.unpresentedFrames == 0)
+
+    m.reset()
+    let cleared = m.sample()
+    check("a reset meter is unavailable again rather than stale",
+          cleared.cpuMilliseconds == nil && cleared.frameIntervalP50 == nil)
 }
 
 print("\n\(checks - failures)/\(checks) checks passed")

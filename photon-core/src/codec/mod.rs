@@ -120,6 +120,21 @@ pub enum CodecError {
     /// Second-stage compressor is not one we know.
     #[error("unknown compressor 0x{0:X}")]
     UnknownCompressor(u8),
+    /// An LZ back-reference pointed before the start of the output produced so
+    /// far. Always a corrupt or misparsed stream — never a recoverable state.
+    #[error("bad back-reference: distance {dist} with only {available} units decoded")]
+    BadDistance {
+        /// Distance the stream asked to look back, in units.
+        dist: usize,
+        /// Units actually decoded so far.
+        available: usize,
+    },
+    /// The compression scheme for this variant has not been reverse-engineered.
+    ///
+    /// Returned rather than guessing. Plausible-looking wrong pixels in a live
+    /// show are worse than a source that refuses to load and says why.
+    #[error("decompression not derived for this variant")]
+    NotDerived,
 }
 
 #[cfg(test)]

@@ -144,19 +144,39 @@ public enum EffectKind: Int32, Sendable, CaseIterable {
     /// What the second control does, for the UI to label it.
     ///
     /// A knob named "Param" is a knob nobody turns. Every effect that uses the
-    /// second control says what it is.
+    /// second control says what it is — and **every effect whose label is `nil`
+    /// ignores `param` entirely in the shader**. The two are checked against each
+    /// other by eye on every change to the switch below; a label that lies is
+    /// worse than no label, because the operator trusts it mid-show.
+    ///
+    /// Three labels changed on the 2026-10-13 quality pass:
+    ///   - `blur` was "Threshold", which a blur does not have. It is "Direction"
+    ///     now and drives a real anisotropic (horizontal↔vertical) blur.
+    ///   - `threshold` was `nil` with `amount` as the cut. The cut moved to
+    ///     `param` so `amount` can be a mix and start from a true identity.
+    ///   - `chromaKey` was "Tolerance" with `amount` as the key hue. Swapped, for
+    ///     the same reason: tolerance at zero keys nothing, which is identity.
     public var paramLabel: String? {
         switch self {
         case .levels: return "Gamma"
-        case .colorize, .duotone, .hueRotate: return "Hue"
+        // `colorize` and `duotone` take an absolute hue to paint with.
+        // `hueRotate` takes an angle to turn the existing hues BY — same word,
+        // two different meanings, which is why it is not called "Hue".
+        case .colorize, .duotone: return "Hue"
+        case .hueRotate: return "Rotation"
         case .posterize: return "Levels"
         case .temperature: return "Tint"
-        case .blur, .glow: return "Threshold"
+        case .threshold: return "Cut"
+        case .blur: return "Direction"
+        case .glow: return "Threshold"
         case .sharpen, .edgeDetect, .emboss: return "Radius"
         case .halftone: return "Dot Size"
         case .kaleidoscope: return "Rotation"
         case .mirror: return "Axis"
-        case .twirl, .fisheye, .zoom: return "Centre"
+        // One knob, one axis. Calling it "Centre" implied a 2D control that does
+        // not exist — Y is pinned to the middle of the frame. A second axis
+        // needs a third parameter, which is a separate piece of work.
+        case .twirl, .fisheye, .zoom: return "Centre X"
         case .wave: return "Frequency"
         case .tile: return "Offset"
         case .slide, .polar: return "Direction"
@@ -166,11 +186,53 @@ public enum EffectKind: Int32, Sendable, CaseIterable {
         case .noise: return "Grain"
         case .strobe: return "Rate"
         case .lumaKey: return "Softness"
-        case .chromaKey: return "Tolerance"
-        case .invert, .saturation, .threshold, .solarize, .exposure,
+        case .chromaKey: return "Key Hue"
+        case .invert, .saturation, .solarize, .exposure,
              .pixelate, .chromaticAberration:
             return nil
         }
+    }
+
+    /// What `amount` means, and therefore where its neutral point sits.
+    ///
+    /// An operator automates `amount` from a fader, an LFO or an envelope. If
+    /// the neutral point is not predictable the effect jumps the moment the
+    /// modulation source touches its rest position, which on a 10-metre wall is
+    /// not a subtlety. So every effect declares which of three shapes it is, and
+    /// the shader is written to honour it exactly — `PhotonVerify` asserts it.
+    public enum AmountMode: String, Sendable {
+        /// `0` is a bit-exact identity, `1` is the effect at full strength.
+        /// This is the default and all but four effects use it.
+        case intensity
+        /// `0.5` is identity; the two halves of the fader do opposite things.
+        /// Only for effects where the inverse is a real, wanted look —
+        /// desaturate/oversaturate, under/over expose, cool/warm, pinch/bulge.
+        case bipolar
+    }
+
+    public var amountMode: AmountMode {
+        switch self {
+        // Bipolar by design. Collapsing these to unipolar would delete the
+        // negative half of each effect, which is half the effect.
+        case .saturation, .exposure, .temperature, .fisheye: return .bipolar
+        default: return .intensity
+        }
+    }
+
+    /// Where `param` has to sit for the effect to be parked, or `nil` if it does
+    /// not matter.
+    ///
+    /// `nil` for everything except `temperature`, and that is deliberate: at the
+    /// neutral `amount` every other effect is an identity no matter where its
+    /// second knob is left, so an operator can preset the second knob and then
+    /// bring the effect in on one fader.
+    ///
+    /// `temperature` is the exception because its two knobs are *independent*
+    /// white-balance axes — warm/cool on `amount`, green/magenta on `param` —
+    /// and gating the tint behind the temperature would make a pure tint
+    /// impossible. It is parked at 0.5/0.5, not at 0.5/anything.
+    public var neutralParam: Float? {
+        self == .temperature ? 0.5 : nil
     }
 
     /// Whether the effect samples beyond the current pixel.
@@ -203,7 +265,10 @@ public enum EffectKind: Int32, Sendable, CaseIterable {
     /// strobe on a still image simply stops.
     public var isTimeVarying: Bool {
         switch self {
-        case .noise, .strobe: return true
+        // `wave` was missing here until 2026-10-13 even though its shader reads
+        // `u.time`: a wave on a still frame would have frozen the moment damage
+        // tracking decided nothing had changed.
+        case .noise, .strobe, .wave: return true
         default: return false
         }
     }
@@ -233,7 +298,11 @@ struct EffectUniforms {
     var amount: Float
     var param: Float
     var kind: Int32
-    /// Seconds since start. Drives grain and anything free-running.
+    /// Seconds since start, for anything that must free-run against wall-clock.
+    /// Nothing does, as of the 2026-10-13 pass: `wave` and `noise` moved onto
+    /// `beat` with `strobe`, because an animating effect that drifts against the
+    /// music is the first thing an operator notices and the last thing they can
+    /// fix from the surface. Kept in the ABI; a future effect may want it.
     var time: Float
     var resolution: SIMD2<Float>
     /// Continuous musical position, so a strobe can lock to tempo rather than
@@ -322,10 +391,17 @@ public final class EffectChain {
                 amount: fx.amount, param: fx.param, kind: fx.kind.rawValue,
                 time: time,
                 resolution: SIMD2(Float(source.width), Float(source.height)),
-                // Wrapped to a bar so the float stays precise across a long
-                // show. A 32-bit float at beat 400,000 cannot represent a
-                // sixteenth note, and a strobe would visibly quantise.
-                beat: Float(beat.truncatingRemainder(dividingBy: 4.0)))
+                // Wrapped so the float stays precise across a long show: a
+                // 32-bit float at beat 400,000 cannot represent a sixteenth
+                // note, and a strobe would visibly quantise.
+                //
+                // 256 beats, not 4. A strobe period that does not divide the
+                // wrap gets one phase discontinuity per wrap, and at a 4-beat
+                // wrap that was a visible stutter every two seconds for most
+                // settings. 256 is a power of two (so every binary division
+                // stays seamless), keeps 2^-15-beat precision in fp32, and
+                // pushes the worst case to once every ~2 minutes at 128 BPM.
+                beat: Float(beat.truncatingRemainder(dividingBy: 256.0)))
             enc.setFragmentBytes(&u, length: MemoryLayout<EffectUniforms>.stride, index: 0)
             enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
             enc.endEncoding()
@@ -364,9 +440,53 @@ public final class EffectChain {
     }
 
     constant float TAU = 6.283185307;
+    constant float GOLDEN_ANGLE = 2.39996323;
 
     static inline float luma709(float3 c) {
         return dot(c, float3(0.2126, 0.7152, 0.0722));
+    }
+
+    // ---- Linear <-> display transfer ----------------------------------------
+    //
+    // Everything in this pipeline is linear light (rgba16Float), which is right
+    // for compositing and wrong for every operation an operator thinks of in
+    // terms of "mid grey". Contrast, gamma, posterize bands, a threshold cut, a
+    // halftone dot's coverage and a hue wheel are all *perceptual* quantities:
+    // done in linear light they bunch everything into the bottom of the range
+    // and the top 80% of the fader does nothing visible.
+    //
+    // So the perceptual effects convert to display space, do the work there, and
+    // convert back. The round trip is exact to ~1e-7, which keeps "amount = 0 is
+    // an identity" true in practice as well as in principle.
+    //
+    // Effects that are physical rather than perceptual — exposure, temperature,
+    // glow's bright pass, every blur and every geometric warp — stay in linear
+    // light, because that is where adding and averaging light is correct.
+    static inline float3 srgbToLin(float3 c) {
+        c = max(c, 0.0);
+        float3 lo = c * (1.0 / 12.92);
+        float3 hi = pow((c + 0.055) * (1.0 / 1.055), 2.4);
+        return select(lo, hi, c > 0.04045);
+    }
+
+    static inline float3 linToSRGB(float3 c) {
+        c = max(c, 0.0);
+        float3 lo = c * 12.92;
+        float3 hi = 1.055 * pow(c, 1.0 / 2.4) - 0.055;
+        return select(lo, hi, c > 0.0031308);
+    }
+
+    /// Perceptual luma, 0...1 for an in-gamut pixel. What a key, a threshold or
+    /// a halftone dot should be measuring.
+    static inline float lumaPerceptual(float3 linear_c) {
+        return luma709(linToSRGB(linear_c));
+    }
+
+    /// A cheap stand-in for the above, for the multi-tap operators where a
+    /// per-tap sRGB transfer is not worth the ALU. sqrt is gamma 2.0 — close
+    /// enough to 2.2 that no one can see the difference in an edge map.
+    static inline float lumaFast(float3 linear_c) {
+        return sqrt(max(luma709(linear_c), 0.0));
     }
 
     // Rodrigues rotation about the grey axis — hue without a full HSV round trip.
@@ -382,25 +502,48 @@ public final class EffectChain {
         return c.z * mix(K.xxx, clamp(p - K.xxx, 0.0, 1.0), c.y);
     }
 
+    /// Chroma coordinates with luma divided out. The right space for a chroma
+    /// key: a desaturated pixel sits near the origin whatever its brightness,
+    /// so grey footage stops being "almost every hue at once".
+    static inline float2 chromaUV(float3 display_c) {
+        float y = luma709(display_c);
+        return float2(display_c.b - y, display_c.r - y);
+    }
+
     static inline float hash21(float2 p) {
         p = fract(p * float2(443.897, 441.423));
         p += dot(p, p + 19.19);
         return fract((p.x + p.y) * p.x);
     }
 
-    // A 5x5 gaussian used by blur, glow and sharpen. Radius in texels.
-    static inline float4 gauss25(texture2d<float> src, sampler sm,
-                                 float2 uv, float2 texel, float r) {
-        float4 sum = float4(0.0);
-        float wsum = 0.0;
-        for (int y = -2; y <= 2; ++y) {
-            for (int x = -2; x <= 2; ++x) {
-                float w = exp(-float(x * x + y * y) * 0.3);
-                sum += src.sample(sm, uv + float2(x, y) * texel * r) * w;
-                wsum += w;
-            }
+    /// 25-tap disc blur on a golden-angle spiral, radius in *output pixels*.
+    ///
+    /// The old 5x5 grid cost the same 25 taps but spaced them on a lattice, so
+    /// past about a 3-texel radius it stopped being a blur and became 25 visible
+    /// ghosts in a square. A spiral with sqrt-distributed radii samples the disc
+    /// uniformly, and `jitter` rotates it per pixel so the residual undersampling
+    /// lands as fine grain instead of as rings — the same trade every real-time
+    /// bokeh does, and the only way to get a wide blur out of one pass.
+    ///
+    /// `aniso` scales the disc per axis, which is what makes a directional blur
+    /// possible without a second pass.
+    static inline float4 discBlur(texture2d<float> src, sampler sm, float2 uv,
+                                  float2 texel, float2 aniso,
+                                  float radiusPx, float jitter) {
+        float4 sum = src.sample(sm, uv);
+        if (!(radiusPx > 0.0)) { return sum; }   // also catches NaN
+        float wsum = 1.0;
+        const int N = 24;
+        for (int i = 0; i < N; ++i) {
+            float fi = float(i) + 0.5;
+            float rr = sqrt(fi / float(N));
+            float th = fi * GOLDEN_ANGLE + jitter;
+            float2 off = float2(cos(th), sin(th)) * rr * radiusPx * aniso * texel;
+            float w = exp(-rr * rr * 1.6);
+            sum += src.sample(sm, uv + off) * w;
+            wsum += w;
         }
-        return sum / max(wsum, 1e-5);
+        return sum / wsum;
     }
 
     // The `case` numbers below are `EffectKind.rawValue` and nothing else.
@@ -416,225 +559,450 @@ public final class EffectChain {
         float2 texel = 1.0 / u.resolution;
         float  a = u.amount;
         float  p = u.param;
+        // Aspect, for every effect with a notion of "round" or "the same
+        // distance in both directions". Without it a kaleidoscope on a 16:9
+        // canvas is an ellipse and a vignette is an oval, which reads as a bug.
+        float  asp = u.resolution.x / max(u.resolution.y, 1.0);
+        float2 aspv = float2(asp, 1.0);
+        float  minRes = min(u.resolution.x, u.resolution.y);
 
         switch (u.kind) {
 
         // ---- Colour: operate on the pixel where it is ----
-        case 0: {   // levels — contrast about mid-grey, then gamma
+        //
+        // These are perceptual operations, so they run in display space. In
+        // linear light a "contrast" knob crushes everything below 18% grey and
+        // the operator only ever uses the first fifth of the fader.
+        case 0: {   // levels — contrast (amount) then gamma (param)
             float4 c = src.sample(sm, uv);
-            float3 v = (c.rgb - 0.5) * (1.0 + a * 3.0) + 0.5;
-            v = pow(max(v, 0.0), float3(mix(0.4, 2.5, p)));
-            return float4(v, c.a);
+            float3 s = linToSRGB(c.rgb);
+            float contrast = 1.0 + a * a * 7.0;         // 1x .. 8x
+            // Gamma is neutral at param 0.5, and `amount` is the drive for BOTH
+            // knobs — raising gamma to the power of `amount` is what keeps
+            // amount = 0 an exact identity even with the gamma knob parked
+            // somewhere else. A fader at rest must not be doing anything.
+            float gBase = (p <= 0.5) ? mix(0.35, 1.0, p * 2.0)
+                                     : mix(1.0, 3.0, (p - 0.5) * 2.0);
+            float g = pow(gBase, a);
+            s = (s - 0.5) * contrast + 0.5;
+            s = pow(max(s, 0.0), g);
+            return float4(srgbToLin(s), c.a);
         }
         case 1: {   // invert
+            // Perceptual, not 1-x in linear light: a linear invert turns mid
+            // grey into near-white and looks blown out. This one maps 18% grey
+            // to 18% grey's complement, which is what an operator expects.
             float4 c = src.sample(sm, uv);
-            return float4(mix(c.rgb, 1.0 - c.rgb, a), c.a);
+            float3 inv = srgbToLin(1.0 - linToSRGB(c.rgb));
+            return float4(mix(c.rgb, inv, a), c.a);
         }
-        case 2: {   // saturation — 0.5 is identity, 0 greyscale, 1 double
+        case 2: {   // saturation — BIPOLAR: 0 grey, 0.5 identity, 1 is 3x
             float4 c = src.sample(sm, uv);
-            return float4(mix(float3(luma709(c.rgb)), c.rgb, a * 2.0), c.a);
+            float3 s = linToSRGB(c.rgb);
+            float l = luma709(s);
+            float k = (a <= 0.5) ? (a * 2.0) : (1.0 + (a - 0.5) * 4.0);
+            s = max(l + (s - l) * k, 0.0);
+            return float4(srgbToLin(s), c.a);
         }
-        case 3: {   // hue rotate — param picks the angle, amount mixes
+        case 3: {   // hue rotate — param is the target hue, amount how far
+            // The old version cross-faded between the original and the rotated
+            // colour, which desaturates through the middle of the fader. Scaling
+            // the *angle* keeps saturation and still lands on identity at zero.
             float4 c = src.sample(sm, uv);
-            return float4(mix(c.rgb, saturate(hueShift(c.rgb, p * TAU)), a), c.a);
+            float3 s = linToSRGB(c.rgb);
+            float3 r = max(hueShift(s, a * p * TAU), 0.0);
+            return float4(srgbToLin(r), c.a);
         }
-        case 4: {   // colorize — luma tinted by a hue
+        case 4: {   // colorize — luma ramped into a single hue
             float4 c = src.sample(sm, uv);
-            float3 t = hsv2rgb(float3(p, 1.0, 1.0)) * luma709(c.rgb);
-            return float4(mix(c.rgb, t, a), c.a);
+            float3 s = linToSRGB(c.rgb);
+            float3 t = hsv2rgb(float3(fract(p), 1.0, 1.0)) * luma709(s);
+            return float4(srgbToLin(mix(s, t, a)), c.a);
         }
-        case 5: {   // duotone — luma ramped between complementary hues
+        case 5: {   // duotone — shadows and highlights to complementary hues
             float4 c = src.sample(sm, uv);
-            float3 lo = hsv2rgb(float3(p, 0.9, 0.25));
-            float3 hi = hsv2rgb(float3(fract(p + 0.5), 0.7, 1.0));
-            return float4(mix(c.rgb, mix(lo, hi, luma709(c.rgb)), a), c.a);
+            float3 s = linToSRGB(c.rgb);
+            float l = saturate(luma709(s));
+            float3 lo = hsv2rgb(float3(fract(p), 0.85, 0.20));
+            float3 hi = hsv2rgb(float3(fract(p + 0.5), 0.65, 1.0));
+            // Smoothstepped ramp: a linear ramp between two saturated hues goes
+            // muddy through the midtones.
+            float3 d = mix(lo, hi, l * l * (3.0 - 2.0 * l));
+            return float4(srgbToLin(mix(s, d, a)), c.a);
         }
-        case 6: {   // threshold — amount IS the cut point
+        case 6: {   // threshold — param is the cut, amount the mix
             float4 c = src.sample(sm, uv);
-            return float4(float3(step(a, luma709(c.rgb))), c.a);
+            float l = lumaPerceptual(c.rgb);
+            // Antialiased: a hard step on a moving image crawls badly, and the
+            // screen is 10 metres wide. fwidth gives the cut a one-pixel ramp
+            // for free. Floored so a flat region cannot divide by zero.
+            float w = max(fwidth(l) * 0.5, 1e-4);
+            float k = smoothstep(p - w, p + w, l);
+            return float4(mix(c.rgb, float3(k), a), c.a);
         }
-        case 7: {   // posterize — param sets the step count
+        case 7: {   // posterize — param sets the band count
             float4 c = src.sample(sm, uv);
-            float n = max(2.0, floor(mix(2.0, 16.0, 1.0 - p)));
-            return float4(mix(c.rgb, floor(c.rgb * n) / n, a), c.a);
+            float3 s = linToSRGB(c.rgb);
+            // Label says "Levels", so more param = more levels. It was inverted.
+            float n = max(floor(mix(2.0, 16.0, p)), 2.0);
+            // Bands in perceptual space, spanning the full 0..1 range, so the
+            // darkest band is black and the brightest is white.
+            float3 q = saturate(floor(min(s, 0.99999) * n) / (n - 1.0));
+            return float4(srgbToLin(mix(s, q, a)), c.a);
         }
-        case 8: {   // solarize — invert only above mid
+        case 8: {   // solarize — Sabattier fold of the highlights
             float4 c = src.sample(sm, uv);
-            float3 s = select(c.rgb, 1.0 - c.rgb, c.rgb > 0.5);
-            return float4(mix(c.rgb, s, a), c.a);
+            float3 s = linToSRGB(c.rgb);
+            // min(s, 1-s) is the same curve as the old branch but branchless and
+            // safe above 1.0, where HDR pixels used to flip to large negatives.
+            float3 f = min(s, max(1.0 - s, 0.0));
+            return float4(srgbToLin(mix(s, f, a)), c.a);
         }
-        case 9: {   // exposure — 0.5 is identity, +/- 3 stops
+        case 9: {   // exposure — BIPOLAR: 0.5 identity, +/- 4 stops
+            // Stays in linear light on purpose. Exposure is a physical scaling
+            // of light and this is the one place linear is unambiguously right.
             float4 c = src.sample(sm, uv);
-            return float4(c.rgb * exp2(mix(-3.0, 3.0, a)), c.a);
+            return float4(c.rgb * exp2((a - 0.5) * 8.0), c.a);
         }
-        case 10: {  // temperature — amount warms/cools, param tints green/magenta
+        case 10: {  // temperature — BIPOLAR on both knobs, 0.5/0.5 identity
             float4 c = src.sample(sm, uv);
             float t = (a - 0.5) * 2.0;
             float g = (p - 0.5) * 2.0;
-            float3 v = c.rgb * float3(1.0 + t * 0.4, 1.0 + g * 0.2, 1.0 - t * 0.4);
+            float3 v = c.rgb * float3(exp2(t * 0.9), exp2(g * 0.45), exp2(-t * 0.9));
+            // Renormalise to the original luma: a white balance shift should
+            // change the colour of the light, not how much of it there is.
+            // Without this the knob doubles as a brightness control and an
+            // operator chasing a warm look ends up clipping the wall.
+            float l0 = luma709(max(c.rgb, 0.0));
+            float l1 = luma709(max(v, 0.0));
+            v *= (l0 > 1e-5 && l1 > 1e-5) ? (l0 / l1) : 1.0;
             return float4(max(v, 0.0), c.a);
         }
 
         // ---- Stylise: read a neighbourhood ----
-        case 11: {  // blur
-            return gauss25(src, sm, uv, texel, a * 8.0);
+        case 11: {  // blur — 25-tap disc, radius up to 15% of the short edge
+            // At amount 1 this is ~160px at 1080p: the picture is *gone*, which
+            // is what the top of the fader is for. The old 5x5 grid topped out
+            // at 8 texels and the last two thirds of the sweep did nothing.
+            float rad = a * a * 0.15 * minRes;
+            float t = (p - 0.5) * 2.0;
+            // Direction: 0 = horizontal streak, 0.5 = round, 1 = vertical.
+            float2 aniso = float2(mix(1.0, 0.12, saturate(t)),
+                                  mix(1.0, 0.12, saturate(-t)));
+            float j = hash21(uv * u.resolution) * TAU;
+            return discBlur(src, sm, uv, texel, aniso, rad, j);
         }
-        case 12: {  // sharpen — unsharp mask
+        case 12: {  // sharpen — unsharp mask, 9 taps (was 25)
+            float r = mix(0.6, 4.0, p);
             float4 c = src.sample(sm, uv);
-            float4 b = gauss25(src, sm, uv, texel, mix(1.0, 4.0, p));
-            return float4(c.rgb + (c.rgb - b.rgb) * a * 3.0, c.a);
+            float3 b = float3(0.0);
+            float wsum = 0.0;
+            for (int y = -1; y <= 1; ++y) {
+                for (int x = -1; x <= 1; ++x) {
+                    float w = (x == 0 && y == 0) ? 4.0 : ((x == 0 || y == 0) ? 2.0 : 1.0);
+                    b += src.sample(sm, uv + float2(x, y) * texel * r).rgb * w;
+                    wsum += w;
+                }
+            }
+            b /= wsum;
+            // Clamped at zero: an unsharp mask on a hard edge undershoots, and a
+            // negative in a linear-light buffer survives all the way to a pow()
+            // in the output encode, where it becomes NaN.
+            return float4(max(c.rgb + (c.rgb - b) * a * 4.0, 0.0), c.a);
         }
-        case 13: {  // edge detect — sobel magnitude
+        case 13: {  // edge detect — sobel on perceptual luma
             float r = mix(1.0, 4.0, p);
             float gx = 0.0, gy = 0.0;
             for (int y = -1; y <= 1; ++y) {
                 for (int x = -1; x <= 1; ++x) {
-                    float l = luma709(src.sample(sm, uv + float2(x, y) * texel * r).rgb);
+                    float l = lumaFast(src.sample(sm, uv + float2(x, y) * texel * r).rgb);
                     float sx = float(x) * ((y == 0) ? 2.0 : 1.0);
                     float sy = float(y) * ((x == 0) ? 2.0 : 1.0);
                     gx += l * sx; gy += l * sy;
                 }
             }
-            float e = sqrt(gx * gx + gy * gy);
+            // Edges off a linear-light luma are invisible in shadow and blown in
+            // highlight; off a gamma-ish luma they track what the eye sees.
+            float e = saturate(sqrt(gx * gx + gy * gy) * 1.25);
             float4 c = src.sample(sm, uv);
-            return float4(mix(c.rgb, float3(e), a), c.a);
+            return float4(mix(c.rgb, srgbToLin(float3(e)), a), c.a);
         }
-        case 14: {  // emboss — directional difference plus mid-grey
+        case 14: {  // emboss — diagonal difference around perceptual mid-grey
             float r = mix(1.0, 4.0, p);
-            float3 d = src.sample(sm, uv - texel * r).rgb
-                     - src.sample(sm, uv + texel * r).rgb;
-            float e = luma709(d) + 0.5;
+            float d = lumaFast(src.sample(sm, uv - texel * r).rgb)
+                    - lumaFast(src.sample(sm, uv + texel * r).rgb);
+            // 0.5 here means *perceptual* mid-grey, so it is converted rather
+            // than written straight into a linear buffer where it reads as 73%.
+            float e = saturate(0.5 + d * 2.0);
             float4 c = src.sample(sm, uv);
-            return float4(mix(c.rgb, float3(e), a), c.a);
+            return float4(mix(c.rgb, srgbToLin(float3(e)), a), c.a);
         }
-        case 15: {  // glow — bright pass, blurred, added back
+        case 15: {  // glow — thresholded bright pass, blurred, added back
+            // The bright pass now happens *per tap*, before the blur. Blurring
+            // first and thresholding after (the old order) halos the whole
+            // image instead of only what is actually bright.
             float4 c = src.sample(sm, uv);
-            float4 b = gauss25(src, sm, uv, texel, 6.0);
-            float3 bright = max(b.rgb - p, 0.0);
-            return float4(c.rgb + bright * a * 2.0, c.a);
+            float thr = mix(0.02, 1.2, p);
+            float rad = (0.012 + a * 0.06) * minRes;   // radius follows amount
+            float j = hash21(uv * u.resolution + 7.13) * TAU;
+            float3 sum = max(c.rgb - thr, 0.0);
+            float wsum = 1.0;
+            const int N = 20;
+            for (int i = 0; i < N; ++i) {
+                float fi = float(i) + 0.5;
+                float rr = sqrt(fi / float(N));
+                float th = fi * GOLDEN_ANGLE + j;
+                float2 off = float2(cos(th), sin(th)) * rr * rad * texel;
+                float w = exp(-rr * rr * 1.4);
+                sum += max(src.sample(sm, uv + off).rgb - thr, 0.0) * w;
+                wsum += w;
+            }
+            // Linear light, additively — bloom is light arriving, not a blend.
+            return float4(c.rgb + (sum / wsum) * a * 3.0, c.a);
         }
-        case 16: {  // halftone — luma into dots on a rotated grid
-            float cell = mix(4.0, 40.0, p);
-            float2 g = uv * u.resolution / cell;
-            float ang = 0.4;
-            float2 rg = float2(g.x * cos(ang) - g.y * sin(ang),
-                               g.x * sin(ang) + g.y * cos(ang));
-            float2 f = fract(rg) - 0.5;
-            float l = luma709(src.sample(sm, (floor(rg) + 0.5) * cell / u.resolution).rgb);
-            float dot_ = step(length(f), sqrt(l) * 0.7);
+        case 16: {  // halftone — perceptual luma into dots on a rotated grid
+            float cellPx = mix(3.0, 40.0, p);
+            float ca = cos(0.4), sa = sin(0.4);
+            float2 g = uv * u.resolution / cellPx;
+            float2 rg = float2(g.x * ca - g.y * sa, g.x * sa + g.y * ca);
+            float2 cc = floor(rg) + 0.5;
+            // Un-rotate the cell centre so the source is sampled where the cell
+            // actually is, and average four points inside it. Sampling one
+            // texel at the centre (the old way) aliased into a shimmering mess
+            // the moment the footage moved.
+            float2 ig = float2(cc.x * ca + cc.y * sa, -cc.x * sa + cc.y * ca);
+            float2 cuv = ig * cellPx / u.resolution;
+            float2 o = cellPx * texel * 0.25;
+            float3 acc = src.sample(sm, cuv + float2(-o.x, -o.y)).rgb
+                       + src.sample(sm, cuv + float2( o.x, -o.y)).rgb
+                       + src.sample(sm, cuv + float2(-o.x,  o.y)).rgb
+                       + src.sample(sm, cuv + float2( o.x,  o.y)).rgb;
+            float3 avg = acc * 0.25;
+            // Dot *area* tracks perceptual luma, so radius goes as its sqrt.
+            float l = saturate(lumaPerceptual(avg));
+            float d = length(rg - cc) - sqrt(l) * 0.78;
+            float w = max(fwidth(d), 1e-4);          // one-pixel edge, no jaggies
+            float dotv = 1.0 - smoothstep(-w, w, d);
+            // Dots carry the cell's hue, normalised to full value — Resolume's
+            // Polkadot keeps the raw cell colour, which darkens twice (small dot
+            // AND dim dot) and loses the shadows entirely. Normalising lets the
+            // dot area do all the tonal work, which is what a halftone is.
+            float mx = max(max(avg.r, avg.g), avg.b);
+            float3 tint = (mx > 1e-3) ? avg / mx : float3(1.0);
             float4 c = src.sample(sm, uv);
-            return float4(mix(c.rgb, float3(dot_), a), c.a);
+            return float4(mix(c.rgb, tint * dotv, a), c.a);
         }
         case 17: {  // pixelate
-            float n = mix(u.resolution.x, 8.0, a);
-            float2 cell = max(u.resolution / max(n, 1.0), float2(1.0));
-            float2 q = (floor(uv * u.resolution / cell) + 0.5) * cell / u.resolution;
-            return src.sample(sm, q);
+            // Geometric, not linear: 1 texel at amount 0 up to 8 blocks across
+            // at amount 1, so the whole sweep is useful instead of the first 5%.
+            float cellPx = pow(max(minRes / 8.0, 1.0), a);
+            float2 q = (floor(uv * u.resolution / cellPx) + 0.5) * cellPx / u.resolution;
+            // Four taps spanning the cell instead of one at its centre — kills
+            // the shimmer a point sample gives on moving footage. The offset
+            // collapses to zero at cellPx = 1, which is what keeps amount = 0 a
+            // bit-exact identity rather than a quarter-texel smear.
+            float2 o = max(cellPx - 1.0, 0.0) * texel * 0.25;
+            float4 s = src.sample(sm, q + float2(-o.x, -o.y))
+                     + src.sample(sm, q + float2( o.x, -o.y))
+                     + src.sample(sm, q + float2(-o.x,  o.y))
+                     + src.sample(sm, q + float2( o.x,  o.y));
+            return s * 0.25;
         }
 
         // ---- Distort: read somewhere else entirely ----
-        case 18: {  // kaleidoscope
-            float2 c = uv - 0.5;
-            float ang = atan2(c.y, c.x) + p * TAU;
-            float rad = length(c);
-            float seg = TAU / max(2.0, floor(mix(2.0, 16.0, a)));
-            ang = abs(fmod(ang, seg) - seg * 0.5);
-            return src.sample(sm, 0.5 + float2(cos(ang), sin(ang)) * rad);
+        case 18: {  // kaleidoscope — amount is segment count, param the rotation
+            float segs = floor(mix(1.0, 16.0, a) + 1e-4);
+            if (segs <= 1.0) { return src.sample(sm, uv); }   // identity at zero
+            float2 d = (uv - 0.5) * aspv;
+            float rad = length(d);
+            float ang = atan2(d.y, d.x) + p * TAU;
+            float seg = TAU / segs;
+            // Positive modulo. fmod() keeps the sign of the dividend, so the old
+            // version folded the left half of the screen differently from the
+            // right and put a seam down the middle.
+            ang -= seg * floor(ang / seg);
+            ang = abs(ang - seg * 0.5);
+            return src.sample(sm, 0.5 + float2(cos(ang), sin(ang)) * rad / aspv);
         }
-        case 19: {  // mirror — param picks the axis
+        case 19: {  // mirror — param picks the axis, amount dissolves it in
             float2 q = uv;
-            if (p < 0.33)      { q.x = 0.5 - abs(q.x - 0.5); }
-            else if (p < 0.66) { q.y = 0.5 - abs(q.y - 0.5); }
-            else               { q = 0.5 - abs(q - 0.5); }
-            return src.sample(sm, mix(uv, q, step(0.001, a)));
+            if (p < 1.0 / 3.0)      { q.x = 0.5 - abs(q.x - 0.5); }
+            else if (p < 2.0 / 3.0) { q.y = 0.5 - abs(q.y - 0.5); }
+            else                    { q = 0.5 - abs(q - 0.5); }
+            // Cross-fade the two images, not the two coordinates. Lerping the
+            // coordinate squashes the picture on the way across; lerping the
+            // colour dissolves, which is what a mix knob should do. The old
+            // step(0.001, a) made this a switch with a dead fader attached.
+            return mix(src.sample(sm, uv), src.sample(sm, q), a);
         }
         case 20: {  // twirl
             float2 ctr = float2(p, 0.5);
-            float2 d = uv - ctr;
+            float2 d = (uv - ctr) * aspv;
             float r = length(d);
-            float ang = atan2(d.y, d.x) + (1.0 - saturate(r * 2.0)) * a * TAU;
-            return src.sample(sm, ctr + float2(cos(ang), sin(ang)) * r);
+            float falloff = 1.0 - smoothstep(0.0, 0.55, r);
+            float ang = atan2(d.y, d.x) + falloff * falloff * a * TAU * 2.0;
+            return src.sample(sm, ctr + float2(cos(ang), sin(ang)) * r / aspv);
         }
-        case 21: {  // fisheye
+        case 21: {  // fisheye — BIPOLAR: 0 pinch, 0.5 identity, 1 bulge
             float2 ctr = float2(p, 0.5);
-            float2 d = uv - ctr;
-            float r = length(d);
-            float k = 1.0 + (a - 0.5) * 2.0;
-            return src.sample(sm, ctr + d * pow(max(r, 1e-5), k - 1.0));
+            float2 d = (uv - ctr) * aspv;
+            // Polynomial lens distortion rather than pow(r, k-1): no singularity
+            // at the centre, no pow of a near-zero base, and the usual shape.
+            float s = max(1.0 + (a - 0.5) * 4.0 * dot(d, d), 0.05);
+            return src.sample(sm, ctr + d * s / aspv);
         }
-        case 22: {  // wave
-            float f = mix(2.0, 40.0, p);
-            float2 q = uv + float2(sin(uv.y * f + u.time) , cos(uv.x * f + u.time))
-                            * a * 0.05;
+        case 22: {  // wave — tempo-locked, see EffectKind.isTimeVarying
+            float f = mix(1.0, 12.0, p) * TAU;
+            // Runs on `beat`, not wall-clock. A ripple that drifts against the
+            // music is the thing a VJ notices first and cannot fix from the
+            // surface. The two rates are 1/2 and 1/4 cycles per beat: binary
+            // fractions, so they are also seamless across the 256-beat wrap.
+            float ph = u.beat * TAU;
+            float2 amp = float2(a * 0.06 / asp, a * 0.06);
+            float2 q = uv + float2(sin(uv.y * f + ph * 0.5),
+                                   sin(uv.x * f * 0.8 + ph * 0.25 + 1.7)) * amp;
             return src.sample(sm, q);
         }
-        case 23: {  // tile
-            float n = max(1.0, floor(mix(1.0, 8.0, a)));
-            return src.sample(sm, fract(uv * n));
+        case 23: {  // tile — amount is the count, param the offset
+            float n = floor(mix(1.0, 8.0, a) + 1e-4);
+            if (n <= 1.0) { return src.sample(sm, uv); }       // identity at zero
+            // param was documented as "Offset" and then ignored. It phases the
+            // tiling now, which is the whole point of having it.
+            float2 q = fract(uv * n + p);
+            // Half a texel in from each wrap, or the linear sampler interpolates
+            // across the seam and every tile gets a bright line down two edges.
+            return src.sample(sm, clamp(q, texel * 0.5, 1.0 - texel * 0.5));
         }
-        case 24: {  // slide
+        case 24: {  // slide — wraps, param is the direction
             float ang = p * TAU;
-            return src.sample(sm, fract(uv + float2(cos(ang), sin(ang)) * a));
+            float2 q = fract(uv + float2(cos(ang), sin(ang)) * a);
+            return src.sample(sm, clamp(q, texel * 0.5, 1.0 - texel * 0.5));
         }
-        case 25: {  // polar
-            float2 c = uv - 0.5;
-            float2 q = float2(atan2(c.y, c.x) / TAU + 0.5, length(c) * 2.0);
+        case 25: {  // polar — param picks the direction of the mapping
+            float2 d = (uv - 0.5) * aspv;
+            float2 toPolar = float2(atan2(d.y, d.x) / TAU + 0.5,
+                                    saturate(length(d) * 2.0));
+            float2 toRect = 0.5 + float2(cos(uv.x * TAU), sin(uv.x * TAU))
+                                  * uv.y * 0.5 / aspv;
+            float2 q = (p < 0.5) ? toPolar : toRect;
             return src.sample(sm, mix(uv, q, a));
         }
-        case 26: {  // zoom
-            float2 ctr = float2(p, 0.5);
-            float s = mix(1.0, 0.2, a);
-            return src.sample(sm, ctr + (uv - ctr) * s);
+        case 26: {  // zoom — param is the centre
+            // Exponential, so the fader is even all the way up to ~11x instead
+            // of spending its first half between 1.0x and 1.6x.
+            return src.sample(sm, float2(p, 0.5) + (uv - float2(p, 0.5)) * exp2(-a * 3.5));
         }
 
         // ---- Texture ----
         case 27: {  // rgb shift — channels diverge along an angle
             float ang = p * TAU;
-            float2 d = float2(cos(ang), sin(ang)) * texel * a * 30.0;
+            // A fraction of the frame, not a texel count: 30 texels is a strong
+            // effect at 480p and invisible at 4K, and the operator should not
+            // have to re-dial the knob when the output resolution changes.
+            float2 d = float2(cos(ang) / asp, sin(ang)) * a * 0.03;
             float4 c = src.sample(sm, uv);
             return float4(src.sample(sm, uv + d).r, c.g, src.sample(sm, uv - d).b, c.a);
         }
         case 28: {  // chromatic aberration — radial, strongest at the edges
-            float2 d = (uv - 0.5) * a * 0.05;
+            float2 d = uv - 0.5;
+            float k = a * 0.09;
+            // Green shifted a third as far in the same direction as red: a real
+            // lens does not leave the green channel exactly where it started,
+            // and the slight offset is what stops this looking like RGB Shift
+            // with a different angle. Four taps, up from three.
             float4 c = src.sample(sm, uv);
-            return float4(src.sample(sm, uv + d).r, c.g, src.sample(sm, uv - d).b, c.a);
+            return float4(src.sample(sm, 0.5 + d * (1.0 + k)).r,
+                          src.sample(sm, 0.5 + d * (1.0 + k * 0.35)).g,
+                          src.sample(sm, 0.5 + d * (1.0 - k)).b,
+                          c.a);
         }
         case 29: {  // vignette
-            float r = length((uv - 0.5) * float2(1.0, u.resolution.y / u.resolution.x));
-            float v = smoothstep(0.75, mix(0.75, 0.1, a), r);
+            // The old form was smoothstep(0.75, mix(0.75, 0.1, a), r), whose two
+            // edges are EQUAL at amount 0 — a division by zero, and whatever the
+            // driver returned for it went straight to the wall. This cannot.
+            float rn = length((uv - 0.5) * aspv) / (0.5 * length(aspv));
+            float soft = mix(0.05, 1.0, p);
+            float start = 1.0 - a;                 // amount 0 -> starts past the corner
+            float t = saturate((rn - start) / max(soft, 1e-3));
+            float v = 1.0 - t * t * (3.0 - 2.0 * t);
             float4 c = src.sample(sm, uv);
             return float4(c.rgb * v, c.a);
         }
-        case 30: {  // scanlines
-            float n = mix(80.0, 900.0, p);
-            float s = 0.5 + 0.5 * sin(uv.y * n * TAU);
+        case 30: {  // scanlines — param is the count, via a pixel pitch
+            // Pitch in *output pixels*, not cycles across the frame. 900 cycles
+            // over a 1080p frame is a 1.2px pitch, which is below Nyquist and
+            // aliases into moire; worse, the same setting means something
+            // different on every output size.
+            float pitch = mix(32.0, 2.0, p);
+            float s = 0.5 + 0.5 * cos((uv.y * u.resolution.y / pitch) * TAU);
+            // Fade the modulation out as the pitch approaches two pixels.
+            float depth = a * saturate(pitch - 1.6);
             float4 c = src.sample(sm, uv);
-            return float4(c.rgb * mix(1.0, s, a), c.a);
+            return float4(c.rgb * mix(1.0, s * s, depth), c.a);
         }
-        case 31: {  // noise — free-running, so it needs `time`
-            float n = hash21(uv * u.resolution + u.time * 60.0);
+        case 31: {  // noise — free-running grain, param is the grain size
+            // param was documented as "Grain" and ignored. It is the grain cell
+            // size now, 1 to 8 pixels.
+            float gs = mix(1.0, 8.0, p);
+            // Re-rolled 32 times a beat off the musical clock rather than off
+            // wall-clock seconds — ~68 Hz at 128 BPM, and it slows with the set
+            // instead of sliding against it. 32 is a power of two, so the
+            // sequence is also continuous across the 256-beat wrap.
+            //
+            // Quantised rather than continuous so the grain is stable *within* a
+            // frame: sampling a hash on an unquantised clock makes the pattern
+            // depend on the exact float the frame was submitted with, which is
+            // how grain ends up crawling at a different rate to the frame rate.
+            float n = hash21(floor(uv * u.resolution / gs) + floor(u.beat * 32.0) * 17.13);
             float4 c = src.sample(sm, uv);
-            return float4(mix(c.rgb, c.rgb * (0.5 + n), a), c.a);
+            // Signed and additive in display space. The old multiplicative
+            // (0.5 + n) form left black pixels black, so grain vanished in the
+            // shadows — exactly where film grain is most visible.
+            float3 s = max(linToSRGB(c.rgb) + (n - 0.5) * a * 0.7, 0.0);
+            return float4(srgbToLin(s), c.a);
         }
         case 32: {  // strobe — gated on musical phase, not wall-clock
-            float phase = fract(u.beat / max(mix(4.0, 0.25, p), 0.01));
-            float g = step(phase, 0.5);
+            float period = mix(4.0, 0.125, p);     // beats per cycle
+            float ph = fract(u.beat / max(period, 1e-3));
+            // A duty cycle, and edges with a ramp. A bare step() gates on or off
+            // between two frames: at 60 Hz against a 128 BPM eighth-note that
+            // lands on a different sub-frame position every cycle and the strobe
+            // visibly stutters. The ramp also means the gate is temporally
+            // antialiased rather than a hard binary per frame.
+            const float duty = 0.4, edge = 0.05;
+            float g = 1.0 - smoothstep(duty - edge, duty + edge, ph);
+            g = max(g, smoothstep(1.0 - edge, 1.0, ph));   // soften the wrap back on
             float4 c = src.sample(sm, uv);
-            return float4(mix(c.rgb, c.rgb * g, a), c.a);
+            return float4(c.rgb * mix(1.0, g, a), c.a);
         }
 
         // ---- Keying ----
         case 33: {  // luma key — amount is the cut, param the softness
             float4 c = src.sample(sm, uv);
-            float k = smoothstep(a, a + mix(0.001, 0.4, p), luma709(c.rgb));
-            return float4(c.rgb, c.a * k);
+            float l = lumaPerceptual(c.rgb);       // perceptual: a key is an eye judgement
+            // Cut spans slightly below zero so that at amount 0 even a pure
+            // black pixel is fully opaque — a true identity, not "almost".
+            float lo = a * 1.05 - 0.05;
+            float soft = mix(0.002, 0.5, p);
+            return float4(c.rgb, c.a * smoothstep(lo, lo + soft, l));
         }
-        case 34: {  // chroma key — distance from a hue, param the tolerance
+        case 34: {  // chroma key — amount is the tolerance, param the key hue
             float4 c = src.sample(sm, uv);
-            float3 key = hsv2rgb(float3(a, 1.0, 1.0));
-            float d = distance(normalize(max(c.rgb, 1e-5)), normalize(key));
-            float k = smoothstep(0.0, mix(0.05, 0.9, p), d);
-            return float4(c.rgb, c.a * k);
+            float3 s = linToSRGB(c.rgb);
+            float3 key = hsv2rgb(float3(fract(p), 1.0, 1.0));
+            // Distance in the luma-free chroma plane. The old version compared
+            // normalize(rgb) vectors, which on desaturated footage is the
+            // direction of a near-grey vector: numerically unstable, wildly
+            // sensitive, and it keyed shadows out of anything slightly tinted.
+            float d = distance(chromaUV(s), chromaUV(key));
+            float tol = a * 1.2;
+            float soft = a * 0.25 + 1e-4;          // never a zero-width smoothstep
+            float k = smoothstep(tol - soft, tol + soft, d);
+            // Spill suppression: partly-keyed pixels keep the key colour around
+            // their edges, which is the giveaway on every bad key. Pull them
+            // toward their own luma in proportion to how keyed they are.
+            float3 despilled = mix(s, float3(luma709(s)), (1.0 - k) * 0.6);
+            return float4(srgbToLin(despilled), c.a * k);
         }
 
         default:

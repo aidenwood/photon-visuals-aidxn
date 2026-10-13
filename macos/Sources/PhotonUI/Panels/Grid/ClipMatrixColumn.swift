@@ -11,9 +11,9 @@ struct ClipMatrixColumn: View {
     }
 
     var body: some View {
-        VStack(spacing: 2) {
+        VStack(spacing: PhotonTheme.panelGap) {
             ColumnTrigger(column: column, trigger: { model.triggerColumn(column) })
-                .frame(height: 26).disabled(switchingDeck)
+                .frame(height: PhotonTheme.panelHeaderHeight).disabled(switchingDeck)
             ForEach(stack.layers) { layer in
                 MatrixClipCell(
                     slot: layer.slot(in: column), activeID: layer.activeClipID,

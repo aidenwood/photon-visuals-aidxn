@@ -53,11 +53,40 @@ public struct LayerState: Sendable {
 }
 
 /// Live numbers for a telemetry panel.
+///
+/// The four timing figures are **optional on purpose**. Each has a real state
+/// in which it is unknown — no frame has completed, no buffer has come back
+/// from the GPU, nothing has been presented to a display — and in that state
+/// it reads as `nil`, which the UI renders as "—". None of them is ever
+/// substituted with a target rate, an estimate, or a zero. A readout that
+/// invents a number is worse than a blank one, because a blank one is the only
+/// version that sends the operator looking for the cause.
+///
+/// Measurement, windows and threading live in ``FrameMeter``.
 public struct EngineTelemetry: Sendable {
-    public var fps: Double = 0
-    public var frameTimeP50: Double = 0
-    public var frameTimeP99: Double = 0
-    public var gpuTime: Double = 0
+    /// Frames per second the display actually presented. Derived from
+    /// `MTLDrawable` presentation timestamps, **not** from the render-call
+    /// rate and never from the target rate — the two only diverge when
+    /// something is wrong, which is exactly when the number is being read.
+    public var outputFPS: Double?
+    /// Median wall interval between frames, ms. Cadence, not cost.
+    public var frameTimeP50: Double?
+    /// 99th-percentile frame interval, ms. `nil` until there are enough
+    /// samples for a 1-in-100 figure to mean anything.
+    public var frameTimeP99: Double?
+    /// Mean GPU milliseconds per frame, from completed command buffers.
+    public var gpuTime: Double?
+    /// Mean CPU milliseconds the engine spent building and submitting a frame.
+    /// Separate from ``frameTimeP50``: a frame can be cheap on the CPU and
+    /// still arrive late.
+    public var cpuTime: Double?
+    /// Frames composited that the display never showed, since startup.
+    ///
+    /// Observed from `presentedTime == 0`, so it counts a condition this code
+    /// can actually see. **Not a dropped-frame count** — rendering faster than
+    /// the refresh rate produces these by design, which is the common case on
+    /// a 120 Hz panel driving a 60 Hz present.
+    public var unpresentedFrames: Int = 0
     public var activeLayers: Int = 0
     /// Frames a source could not supply in time. **Distinct from a dropped
     /// frame**: a repeat means the SOURCE was late, a drop means WE missed a
@@ -149,11 +178,13 @@ public final class PhotonEngine: @unchecked Sendable {
 
     private var t: Float = 0
     private var lastFrame = CACurrentMediaTime()
-    private var frameTimes: [Double] = []
-    private var framesSinceReport = 0
     private var effectedLayersThisFrame = 0
     private var effectPassesThisFrame = 0
     private var lastReport = CACurrentMediaTime()
+
+    /// Frame timing. Owns every number in ``telemetry`` that is a duration or
+    /// a rate; nothing else in the engine measures time for display.
+    public let meter = FrameMeter()
 
     /// Master opacity, applied after the composite.
     public var masterOpacity: Float = 1
@@ -204,6 +235,9 @@ public final class PhotonEngine: @unchecked Sendable {
         self.compositor = c
         self.outputStage = OutputStage(device: device)
         self.effects = EffectChain(device: device)
+        // The compositor's own unwarped fallback path makes its own command
+        // buffer, so it needs the same meter rather than a second one.
+        c.meter = meter
     }
 
     // MARK: - Commands
@@ -340,11 +374,16 @@ public final class PhotonEngine: @unchecked Sendable {
 
     /// Renders one frame. Called from the presentation adapter's display link.
     public func render(drawable: CAMetalDrawable) {
+        // Opens the CPU measurement for this frame. Closed after commit, which
+        // is the last CPU work the engine does for it.
+        meter.beginFrame()
+        // Registered before `present` — a handler added afterwards is never
+        // called. This is the only source of the output FPS figure.
+        meter.observePresentation(of: drawable)
+
         let now = CACurrentMediaTime()
         let dt = now - lastFrame
         lastFrame = now
-        frameTimes.append(dt)
-        if frameTimes.count > 240 { frameTimes.removeFirst() }
         t += Float(min(dt, 1.0 / 30.0))
 
         // Drain MIDI once per frame; external clock is adopted here so
@@ -462,7 +501,7 @@ public final class PhotonEngine: @unchecked Sendable {
                 rp.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
                 stage.encode(into: cb, descriptor: rp, source: work, slices: slices)
             }
-            compositor.noteCompletion(cb)
+            meter.observe(cb)
             cb.present(drawable)
             cb.commit()
         } else {
@@ -471,27 +510,26 @@ public final class PhotonEngine: @unchecked Sendable {
                               textures: boundTextures)
         }
 
-        framesSinceReport += 1
+        meter.endFrame()
+
+        // Republished at a human reading rate, not every frame — the numbers
+        // underneath are already averaged, and a 60 Hz text update is unreadable.
         if now - lastReport >= 0.25 {
-            updateTelemetry(now: now, active: active.count,
+            updateTelemetry(active: active.count,
                             repeats: repeats, needsDest: needsDest)
             lastReport = now
-            framesSinceReport = 0
         }
     }
 
-    private func updateTelemetry(now: CFTimeInterval, active: Int,
-                                 repeats: Int, needsDest: Bool) {
-        let sorted = frameTimes.sorted()
-        func pct(_ p: Double) -> Double {
-            guard !sorted.isEmpty else { return 0 }
-            return sorted[min(sorted.count - 1, Int(Double(sorted.count) * p))] * 1000
-        }
+    private func updateTelemetry(active: Int, repeats: Int, needsDest: Bool) {
+        let sample = meter.sample()
         telemetry = EngineTelemetry(
-            fps: Double(framesSinceReport) / max(now - lastReport, 0.0001),
-            frameTimeP50: pct(0.50),
-            frameTimeP99: pct(0.99),
-            gpuTime: compositor.lastGPUTime * 1000,
+            outputFPS: sample.outputFPS,
+            frameTimeP50: sample.frameIntervalP50,
+            frameTimeP99: sample.frameIntervalP99,
+            gpuTime: sample.gpuMilliseconds,
+            cpuTime: sample.cpuMilliseconds,
+            unpresentedFrames: sample.unpresentedFrames,
             activeLayers: active,
             sourceRepeats: repeats,
             requiresDestinationRead: needsDest,

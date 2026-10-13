@@ -6,7 +6,7 @@ struct PanelFailureView: View {
     let retry: () -> Void
 
     var body: some View {
-        HStack(spacing: compact ? 8 : 12) {
+        HStack(spacing: compact ? 4 : 6) {
             Image(systemName: "exclamationmark.triangle")
                 .foregroundStyle(PhotonTheme.warning)
                 .font(.system(size: compact ? 12 : 22))
@@ -21,16 +21,15 @@ struct PanelFailureView: View {
             Button("Retry", action: retry)
                 .buttonStyle(.plain)
                 .font(.system(size: compact ? 10 : 11, weight: .medium))
-                .padding(.horizontal, compact ? 8 : 12).padding(.vertical, compact ? 5 : 7)
-                .background(PhotonTheme.accent.opacity(0.2), in: RoundedRectangle(cornerRadius: 6))
+                .padding(.horizontal, 6).frame(height: PhotonTheme.controlHeight)
+                .background(PhotonTheme.accent.opacity(0.2), in: Rectangle())
                 .accessibilityLabel("Retry \(issue.title)")
         }
-        .padding(compact ? 8 : 20)
-        .background(PhotonTheme.raised, in: RoundedRectangle(cornerRadius: 8))
+        .padding(PhotonTheme.contentInset)
+        .background(PhotonTheme.raised, in: Rectangle())
         .overlay {
-            RoundedRectangle(cornerRadius: 8).strokeBorder(PhotonTheme.warning.opacity(0.25))
+            Rectangle().strokeBorder(PhotonTheme.warning.opacity(0.25))
         }
-        .padding(compact ? 0 : 16)
         .help(issue.message)
     }
 }

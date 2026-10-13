@@ -15,9 +15,9 @@ struct PanelTabs<Tab: Hashable>: View {
                         .font(.system(size: 10, weight: selection == tab ? .semibold : .regular))
                         .lineLimit(1)
                         .fixedSize(horizontal: true, vertical: false)
-                        .padding(.horizontal, 7)
+                        .padding(.horizontal, PhotonTheme.contentInset)
                         .frame(maxWidth: .infinity)
-                        .frame(height: 29)
+                        .frame(height: PhotonTheme.controlHeight)
                         .foregroundStyle(selection == tab ? PhotonTheme.foreground : PhotonTheme.muted)
                         .background(selection == tab ? PhotonTheme.raised : .clear)
                         .overlay(alignment: .bottom) {

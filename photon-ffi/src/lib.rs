@@ -1269,7 +1269,15 @@ mod tests {
     #[test]
     fn a_document_from_a_newer_build_says_so_plainly() {
         let (_, json) = read(photon_document_default());
-        let bumped = json.replace("\"schemaVersion\": 0", "\"schemaVersion\": 99");
+        // Derived from SCHEMA_VERSION rather than hardcoded: a hardcoded "0"
+        // silently stops substituting the day the schema is bumped, and the
+        // test then passes while asserting nothing.
+        let current = format!("\"schemaVersion\": {}", photon_core::doc::SCHEMA_VERSION);
+        assert!(
+            json.contains(&current),
+            "default document lost its version: {json}"
+        );
+        let bumped = json.replace(&current, "\"schemaVersion\": 99");
         let c = cstr(&bumped);
         let (ok, why) = read(unsafe { photon_document_validate(c.as_ptr()) });
         assert!(!ok);

@@ -7,9 +7,9 @@ struct ParameterReadout: View {
     var body: some View {
         ParameterRow(label: label) {
             Text(value).monospacedDigit()
-                .padding(.horizontal, 10).padding(.vertical, 6)
+                .padding(.horizontal, 6).frame(minHeight: PhotonTheme.controlHeight)
                 .frame(minWidth: 72, alignment: .trailing)
-                .background(PhotonTheme.raised, in: RoundedRectangle(cornerRadius: 5))
+                .background(PhotonTheme.raised, in: Rectangle())
         }
         .font(.system(size: 11))
         .accessibilityElement(children: .ignore)

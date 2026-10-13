@@ -18,6 +18,7 @@ struct PreviewPanel: View {
             PanelBoundary(model: panel, retry: retry) { snapshot in
                 ProgramPreviewSurface(
                     snapshot: snapshot, mapping: model.persona == .map, surface: surface, role: role,
+                    mappingQuad: Binding(get: { model.mappingQuad }, set: { model.mappingQuad = $0 }),
                     fixtureOpacity: model.master.value?.opacity ?? 1,
                     fixtureBlackout: model.master.value?.blackout ?? false
                 )

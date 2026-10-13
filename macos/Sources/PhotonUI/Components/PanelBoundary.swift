@@ -15,16 +15,14 @@ struct PanelBoundary<Value: Sendable, Content: View, Skeleton: View>: View {
                         if model.phase.isLoading {
                             Text("Refreshing")
                                 .font(.system(size: 10))
-                                .padding(6)
-                                .background(PhotonTheme.raised, in: Capsule())
-                                .padding(8)
+                                .padding(PhotonTheme.contentInset)
+                                .background(PhotonTheme.raised, in: Rectangle())
                                 .accessibilityLabel("\(model.name) refreshing")
                         }
                     }
                     .overlay(alignment: .bottom) {
                         if let issue = model.phase.issue {
                             PanelFailureView(issue: issue, compact: true, retry: retry)
-                                .padding(8)
                         }
                     }
             } else if let issue = model.phase.issue {

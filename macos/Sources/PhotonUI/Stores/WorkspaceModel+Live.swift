@@ -96,7 +96,9 @@ extension WorkspaceModel {
 
     private func liveCommand(_ action: WorkspaceAction) {
         commands.send(action) { [weak self] in
-            self?.reloadLayers()
+            // A trigger changes which clip is live, so the clip's chain can
+            // only be re-read once the new layer stack has landed.
+            self?.reloadRenderEffects(after: self?.reloadLayers())
             self?.reloadMasterPreview()
             self?.reloadTransport()
         } failed: { [weak self] issue in

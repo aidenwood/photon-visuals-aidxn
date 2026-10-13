@@ -12,6 +12,7 @@ public final class WorkspaceModel {
     public var isCommandPalettePresented = false
     public var integrationIssue: PanelIssue?
     public var performanceLocked = false
+    public var mappingQuad = MappingQuad.identity
     public internal(set) var requestedBlackout: Bool?
     var blackoutRequest: UInt64 = 0
     public var isBlackedOut: Bool { requestedBlackout ?? master.value?.blackout ?? false }
@@ -26,14 +27,21 @@ public final class WorkspaceModel {
     public let telemetry = PanelModel<TelemetrySnapshot>(name: "Metrics")
     public let layers = PanelModel<LayerStackSnapshot>(name: "Layers")
     public let master = PanelModel<MasterSnapshot>(name: "Master")
+    public let effects = PanelModel<EffectStackSnapshot>(name: "Effects")
+    public let effectDefinitions: [EffectDefinition]
+    /// Every chain the renderer needs, not just the one the inspector shows.
+    /// Maintained by `reloadRenderEffects()`; read by the engine surface.
+    public internal(set) var renderEffects: [InspectorEffectScope: [InspectorEffect]] = [:]
+    var renderEffectsRequest: UInt64 = 0
 
     let provider: any WorkspaceProvider
     let commands: WorkspaceCommandQueue
     let controlRefresh = ControlSnapshotRefresh()
     let preferences = WorkspacePreferences()
 
-    public init(provider: any WorkspaceProvider = PreviewWorkspaceProvider()) {
+    public init(provider: any WorkspaceProvider = PreviewWorkspaceProvider(), effectDefinitions: [EffectDefinition] = []) {
         self.provider = provider
+        self.effectDefinitions = effectDefinitions
         self.commands = WorkspaceCommandQueue(provider: provider)
         self.template = preferences.template(for: persona)
     }
@@ -46,6 +54,7 @@ public final class WorkspaceModel {
             reloadMasterPreview(),
         ]
         for task in tasks { await task.value }
+        reloadRenderEffects()
         if selectedClipID == nil { selectedClipID = library.value?.clips.first?.id }
     }
 
@@ -107,6 +116,10 @@ public final class WorkspaceModel {
     public func setBlendMode(_ mode: String, clipID: String) {
         commands.send(.setBlendMode(clipID: clipID, value: mode)) { [weak self] in
             self?.reloadInspector()
+            // The layer snapshot carries the active clip's blend to the render
+            // surface. Without this refresh the menu updates and the composite
+            // does not, which is exactly the control that looks live and isn't.
+            self?.reloadLayers()
         } failed: { [weak self] issue in
             guard self?.selectedClipID == clipID else { return }
             self?.inspector.report(issue)

@@ -8,25 +8,24 @@ struct ClipMatrixPanel: View {
             PanelBoundary(model: model.layers, retry: { model.reloadLayers() }) { stack in
                 GeometryReader { geometry in
                     let count = max(1, stack.layers.count)
-                    let rowHeight = max(48, (geometry.size.height - 26 - 30 - 8 - CGFloat(count * 2)) / CGFloat(count))
+                    let rowHeight = max(44, (geometry.size.height - PhotonTheme.panelHeaderHeight
+                        - PhotonTheme.deckBarHeight - CGFloat(count) * PhotonTheme.panelGap) / CGFloat(count))
                     VStack(spacing: 0) {
                         ScrollView(.vertical) {
-                        HStack(alignment: .top, spacing: 2) {
+                        HStack(alignment: .top, spacing: PhotonTheme.panelGap) {
                             LayerStrip(model: model, layers: stack.layers, rowHeight: rowHeight)
-                                .frame(width: 230)
+                                .frame(width: PhotonTheme.layerStripWidth)
                             ScrollView(.horizontal) {
-                                LazyHStack(spacing: 2) {
+                                LazyHStack(spacing: PhotonTheme.panelGap) {
                                     ForEach(0..<stack.columns, id: \.self) { column in
                                         ClipMatrixColumn(model: model, stack: stack, column: column, rowHeight: rowHeight)
                                     }
                                 }
-                                .padding(.trailing, 4)
                             }
                         }
                         }
-                        DeckTabs(model: model).frame(height: 30)
+                        DeckTabs(model: model).frame(height: PhotonTheme.deckBarHeight)
                     }
-                    .padding(4)
                 }
             } skeleton: {
                 MatrixSkeleton()

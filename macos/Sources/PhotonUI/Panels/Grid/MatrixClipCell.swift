@@ -15,15 +15,15 @@ struct MatrixClipCell: View {
                             .overlay(alignment: .topLeading) {
                                 if activeID == clip.id {
                                     Image(systemName: "play.fill").font(.system(size: 8))
-                                        .padding(5).background(PhotonTheme.accent).padding(4)
+                                        .padding(3).background(PhotonTheme.accent).padding(2)
                                 }
                             }
                         HStack {
                             Text(clip.title).lineLimit(1)
                             Spacer(minLength: 0)
                         }
-                        .font(.system(size: 9)).padding(.horizontal, 5)
-                        .frame(height: 18)
+                        .font(.system(size: 9)).padding(.horizontal, 3)
+                        .frame(height: 16)
                         .background(activeID == clip.id ? PhotonTheme.accent.opacity(0.3) : PhotonTheme.raised)
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)

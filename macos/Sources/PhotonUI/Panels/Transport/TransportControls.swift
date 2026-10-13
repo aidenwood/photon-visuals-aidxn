@@ -6,7 +6,7 @@ struct TransportControls: View {
     let toggle: () -> Void
 
     var body: some View {
-        HStack(spacing: 14) {
+        HStack(spacing: 8) {
             IconButton(
                 symbol: snapshot.isPlaying ? "pause.fill" : "play.fill",
                 label: snapshot.isPlaying ? "Pause preview controls" : "Play preview controls",
@@ -22,6 +22,6 @@ struct TransportControls: View {
                 .monospacedDigit().font(.system(size: 12, weight: .medium))
             Text("BPM").font(.system(size: 9)).foregroundStyle(PhotonTheme.faint)
         }
-        .padding(.horizontal, 14)
+        .padding(.horizontal, PhotonTheme.contentInset)
     }
 }

@@ -7,14 +7,25 @@ struct ColumnInspector: View {
         PanelBoundary(model: model.layers, retry: { model.reloadLayers() }) { snapshot in
             if let column = model.selectedColumn {
                 ScrollView {
-                    VStack(alignment: .leading, spacing: 12) {
-                        Text("Column \(column + 1)").font(.system(size: 12, weight: .medium))
+                    VStack(alignment: .leading, spacing: 1) {
                         ForEach(snapshot.layers) { layer in
-                            ParameterReadout(label: layer.title, value: layer.slot(in: column)?.clip?.title ?? "Empty")
+                            InspectorSection(layer.title, detail: layer.slot(in: column)?.clip?.title ?? "Empty") {
+                                if let clip = layer.slot(in: column)?.clip {
+                                    InspectorSelectionView(clip: clip)
+                                    Button("Inspect clip") { model.selectClip(clip.id) }
+                                        .buttonStyle(.plain).foregroundStyle(PhotonTheme.accent)
+                                } else {
+                                    Text("Empty clip slot").font(.system(size: 10)).foregroundStyle(PhotonTheme.faint)
+                                }
+                            }
                         }
-                        Button("Trigger column") { model.triggerColumn(column) }
-                            .buttonStyle(.bordered).controlSize(.small).tint(PhotonTheme.accent)
-                    }.padding(14)
+                        Button { model.triggerColumn(column) } label: {
+                            Text("Trigger column")
+                                .padding(.horizontal, 6).frame(height: PhotonTheme.controlHeight)
+                                .background(PhotonTheme.raised, in: Rectangle())
+                        }
+                        .buttonStyle(.plain).foregroundStyle(PhotonTheme.accent)
+                    }
                 }
             } else {
                 PanelEmptyView(symbol: "rectangle.split.3x1", title: "Select a column", detail: "Click a column trigger above the clips.")

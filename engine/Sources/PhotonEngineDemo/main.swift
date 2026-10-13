@@ -194,11 +194,16 @@ final class DemoView: NSView {
         let t = engine.telemetry
         let rigName = ["single", "2-projector", "4-projector"][rig]
         let fxName = effectIndex >= 0 ? EffectKind.allCases[effectIndex].name : "none"
-        let line = String(
-            format: "Photon · %d layers · %.0f fps · p50 %.2fms · GPU %.2fms · %@%@ · fx: %@ · blend: %@ · %@",
-            t.activeLayers, t.fps, t.frameTimeP50, t.gpuTime,
-            rigName, keystoned ? " + keystone" : "", fxName, topBlend.name,
-            testPattern?.name ?? "deck q:\(engine.deck.quantise.name)")
+        // An unmeasured metric prints as "—", never as 0 — a stats line that
+        // reads "0.00ms GPU" looks like a working measurement of a free GPU.
+        func ms(_ v: Double?) -> String { v.map { String(format: "%.2fms", $0) } ?? "—" }
+        func fps(_ v: Double?) -> String { v.map { String(format: "%.0f fps", $0) } ?? "— fps" }
+        let line = "Photon · \(t.activeLayers) layers · \(fps(t.outputFPS))"
+            + " · p50 \(ms(t.frameTimeP50)) · CPU \(ms(t.cpuTime)) · GPU \(ms(t.gpuTime))"
+            + " · unpresented \(t.unpresentedFrames)"
+            + " · \(rigName)\(keystoned ? " + keystone" : "") · fx: \(fxName)"
+            + " · blend: \(topBlend.name)"
+            + " · \(testPattern?.name ?? "deck q:\(engine.deck.quantise.name)")"
         onStats?(line)
         // Also to stdout, so the demo can be verified headlessly (and in CI)
         // without depending on window enumeration or a screenshot.

@@ -28,6 +28,7 @@ swiftc -parse-as-library -swift-version 6 \
   "$PHOTON_PACKAGE/Tests/PhotonUITests/PanelModelTests.swift" \
   "$PHOTON_PACKAGE/Tests/PhotonUITests/SnapshotValidationTests.swift" \
   "$PHOTON_PACKAGE/Tests/PhotonUITests/WorkspaceControlTests.swift" \
+  "$PHOTON_PACKAGE/Tests/PhotonUITests/EffectDropTests.swift" \
   "$PHOTON_PACKAGE/Tests/PhotonUITests/RecoveryCases.swift" \
   "$PHOTON_PACKAGE/Checks/RunChecks.swift" \
   -o "$PHOTON_BIN/PhotonUIChecks"

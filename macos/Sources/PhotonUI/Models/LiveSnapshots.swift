@@ -22,15 +22,19 @@ public struct LayerSnapshot: Identifiable, Sendable {
     public let bypass: Bool
     public let solo: Bool
     public let activeClipID: String?
+    /// How the launched clip composites against the layers beneath it.
+    /// Defaulted so existing providers stay source-compatible.
+    public let blendMode: String
     public let slots: [ClipSlotSnapshot]
     private let slotsByColumn: [Int: ClipSlotSnapshot]
 
     public init(
         id: String, title: String, opacity: Double, bypass: Bool, solo: Bool,
-        activeClipID: String?, slots: [ClipSlotSnapshot]
+        activeClipID: String?, blendMode: String = "Normal", slots: [ClipSlotSnapshot]
     ) {
         self.id = id; self.title = title; self.opacity = opacity
-        self.bypass = bypass; self.solo = solo; self.activeClipID = activeClipID; self.slots = slots
+        self.bypass = bypass; self.solo = solo; self.activeClipID = activeClipID
+        self.blendMode = blendMode; self.slots = slots
         self.slotsByColumn = Dictionary(slots.map { ($0.column, $0) }, uniquingKeysWith: { first, _ in first })
     }
 

@@ -6,11 +6,11 @@ struct ParameterRow<Control: View>: View {
     @ViewBuilder let control: () -> Control
 
     var body: some View {
-        HStack(spacing: 10) {
+        HStack(spacing: 6) {
             Text(label).font(.system(size: 10)).foregroundStyle(PhotonTheme.muted)
-                .lineLimit(1).frame(width: 76, alignment: .trailing)
+                .lineLimit(1).frame(width: 68, alignment: .trailing)
             control().frame(maxWidth: .infinity, alignment: .leading)
         }
-        .frame(minHeight: 27)
+        .frame(minHeight: PhotonTheme.controlHeight)
     }
 }

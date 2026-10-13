@@ -2,15 +2,15 @@ import SwiftUI
 
 struct LibrarySkeleton: View {
     var body: some View {
-        VStack(alignment: .leading, spacing: 21) {
+        VStack(alignment: .leading, spacing: 8) {
             ForEach(0..<6) { _ in
-                VStack(alignment: .leading, spacing: 7) {
+                VStack(alignment: .leading, spacing: 2) {
                     SkeletonBlock(width: 120)
                     SkeletonBlock(width: 80, height: 8)
                 }
             }
         }
-        .padding(.vertical, 10)
+        .padding(PhotonTheme.contentInset)
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 }

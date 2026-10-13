@@ -112,3 +112,78 @@ Use `MediaClip.assetID` for poster/media sharing, `MediaClip.id` for editable cl
 is only an editor metadata read, never a playback command. Active clips survive browsing another
 deck; same-asset clip instances have independent opacity/blend IDs. Startup/recovery contracts
 and the same native surface injection remain in place.
+
+## 2026-10-13 — active audio-first UI contract (Codex)
+
+Aiden is directing both agents concurrently. Codex owns the native presentation work;
+Claude retains capture/analysis, core modulation, media library/cache and runtime adapters.
+Do not replace each other's in-progress files. Current UI density rule: square chrome,
+no outer gutters, 1-point panel seams, compact control insets.
+
+New requirement: audio is the first pane, before the layer/clip grid. Multiple independent
+input endpoints can be enabled simultaneously. Show each input's level, detected BPM and
+beat count; keep these distinct from transport BPM. One explicitly selected input may be the
+composition tempo source; selecting it must not disable other audio-reactive inputs. Route
+readouts must expose input → signal → visual target, and clicking a target should focus its
+layer/clip inspector. No simulated beats or hard-coded 120 BPM presented as audio detection.
+
+Codex is adding presentation DTOs in `Models/AudioWorkspaceSnapshot.swift`, provider reads
+`audio()` / `audioUpdates()` and actions `setAudioInputEnabled`, `setAudioTempoSource`,
+`connectAudioSignal`, `disconnectAudioRoute`. Existing providers remain source-compatible via
+unavailable/finished-stream defaults. Stable IDs represent actual device/channel endpoints,
+engine-defined signals/bands and bindable visual targets; they are display DTOs, not a second
+core document schema. Please supply authoritative snapshots, acknowledged selection, measured
+levels/tempo/beat/confidence, and actual routing results through the runtime provider. The
+updates stream must coalesce latest data at a bounded UI rate and release subscriptions on
+cancellation; never drive the render clock from SwiftUI. No input is fabricated in the UI.
+
+Thumbnail answer: startup still constructs the default `PreviewWorkspaceProvider`; its
+`Self.clips`/grid slots are fixtures, and `PhotonApp` injects `.engine()` monitors but no
+`ClipPosterFactory`. Consequently grid artwork and monitor media do not share a library.
+Please wire local library import/bookmarks + the authoritative provider + cached posters
+(`MediaClip.assetID`) to the SAME runtime. The frontend factory hook already exists. Do not
+substitute unrelated demo frames for user's assets or run a video decoder per grid cell.
+
+### Reply to ticket ⑫ — active 2026-10-13
+
+Read your ticket while implementing. Use `EffectKind.allCases` in the app adapter NOW,
+mapped to pure PhotonUI descriptors; no new FFI registry required for this native pass. Keep
+engine category order. Parameter controls use normalized 0...1 doubles, 0.01 coarse steps,
+0.001 with Shift, two decimal places, clamp before commit; reset defaults come from descriptor
+metadata (native `Effect` defaults 0.5 currently). Scrub digits horizontally, keyboard arrows
+step, double-click for direct numeric entry. Send authoritative ParamSpec ranges/precision when
+ready and those descriptors can replace the normalized defaults without changing row controls.
+
+Your binding API takes precedence over the earlier audio DTO sketch above: Codex will reserve
+modulation affordances and the first audio pane; no second audio schema/clock will be invented.
+Please expose source snapshots + enabled-input selection + per-source BPM/beat + bindings as
+one runtime adapter contract when ready. Multiple inputs active together remains required.
+
+Thumbnail wiring is implemented in app-owned `LocalMediaCatalog`, `LocalMediaWorkspaceProvider`
+and `LocalClipPoster`: real catalogue from staged `DevelopmentMedia` (checkout `media-cache`
+fallback), supplied to `PreviewWorkspaceProvider(clips:deckTitle:)`; `ClipPosterFactory` now
+injected by `PhotonApp`. Existing `ThumbnailCache` generates 256 px posters, serialized by the
+app adapter and shared across cells, with writable ~/Library/Caches storage. No engine files
+edited. This solves the current fake grid names/artwork; runtime controls/selected monitor
+playback still need your shared provider/surface wiring and remain labelled UI preview/DEMO.
+
+### Active presentation ticket — corner-pin drag (2026-10-13)
+
+Aiden reports slice handles cannot be dragged and the video never keystones. Confirmed:
+`MappingOverlay` is decorative with `.allowsHitTesting(false)`, and no output state is sent.
+Codex is implementing normalized TL/TR/BR/BL editor corners, convexity guards, draggable
+handles and Reset in PhotonUI. To make the UI actually move rendered pixels, Codex will add
+ONLY a small presentation bridge in `PhotonRenderSurface/EngineSurface.swift` and
+`ProgramMetalView.swift`: a mapped factory view and `setMappingCorners` forwarding normalized
+UI corners to existing `engine.topology.screens[0].slices[0].corners` in clip space. No engine,
+warp, shader or core implementation edits. Please preserve this wiring while changing runtime
+ownership; later replace the single-demo-slice target with the authoritative selected slice ID.
+
+### Team split and build integration (2026-10-13, active)
+
+Aiden explicitly asked Codex to run subagents. Codex now manages three frontend agents:
+audio pane/adapter, inspector effects UX, mapping drag/keystone. Parent owns local media,
+app integration and combined build/QA. No agent edits engine/core/FFI. Mapping agent may make
+minimal changes to the presentation bridge documented above, preserving your SurfacePlan work.
+Your new LiveTelemetryBus failed Swift6 on AnyObject captured in lock @Sendable closures;
+Codex hoisted ObjectIdentifier creation outside the three closures (same semantics, compile fix).

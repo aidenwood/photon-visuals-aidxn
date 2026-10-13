@@ -4,23 +4,23 @@ struct WorkspaceHeader: View {
     @Bindable var model: WorkspaceModel
 
     var body: some View {
-        HStack(spacing: 22) {
-            HStack(spacing: 10) {
+        HStack(spacing: 8) {
+            HStack(spacing: 6) {
                 Image(systemName: "circle.hexagongrid.fill")
-                    .font(.system(size: 22)).foregroundStyle(PhotonTheme.accent)
-                Text("PHOTON").font(.system(size: 13, weight: .semibold)).tracking(2.6)
+                    .font(.system(size: 16)).foregroundStyle(PhotonTheme.accent)
+                Text("PHOTON").font(.system(size: 11, weight: .semibold)).tracking(1.6)
             }
-            .frame(width: 174, alignment: .leading)
+            .frame(width: 132, alignment: .leading)
 
-            HStack(spacing: 4) {
+            HStack(spacing: 1) {
                 ForEach(WorkspacePersona.allCases) { persona in
                     Button { model.switchPersona(persona) } label: {
                         Label(persona.rawValue, systemImage: persona.symbol)
                             .font(.system(size: 11, weight: .medium))
-                            .padding(.horizontal, 13).padding(.vertical, 8)
+                            .padding(.horizontal, 8).frame(height: PhotonTheme.controlHeight)
                             .background(
                                 model.persona == persona ? PhotonTheme.accent.opacity(0.16) : .clear,
-                                in: RoundedRectangle(cornerRadius: 6)
+                                in: Rectangle()
                             )
                     }
                     .buttonStyle(.plain)
@@ -51,19 +51,19 @@ struct WorkspaceHeader: View {
             DiagnosticsMenu(model: model)
             #endif
             Button { model.isCommandPalettePresented = true } label: {
-                HStack(spacing: 12) {
+                HStack(spacing: 6) {
                     Image(systemName: "magnifyingglass")
                     Text("Commands")
                     Text("⌘ K").foregroundStyle(PhotonTheme.faint)
                 }
                 .font(.system(size: 11))
-                .padding(.horizontal, 11).padding(.vertical, 8)
-                .background(PhotonTheme.raised, in: RoundedRectangle(cornerRadius: 6))
+                .padding(.horizontal, 6).frame(height: PhotonTheme.controlHeight)
+                .background(PhotonTheme.raised, in: Rectangle())
             }
             .buttonStyle(.plain).foregroundStyle(PhotonTheme.muted)
         }
-        .padding(.horizontal, 20)
-        .frame(height: 42)
+        .padding(.horizontal, PhotonTheme.contentInset)
+        .frame(height: 30)
         .background(PhotonTheme.panel)
         .overlay(alignment: .bottom) { Rectangle().fill(PhotonTheme.border).frame(height: 1) }
     }

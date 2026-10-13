@@ -44,7 +44,10 @@ REA is the inspection tool, not a UI component repository or visual template.
 The palette comes from [Velocity 9 editor](../../velocity9-editor/tailwind.config.ts):
 dark `#0c0c10` canvas, `#141419` panels, `#1c1c24` raised controls, thin `#26262f` edges,
 violet `#8b5cf6`, foreground `#e7e7ee` and restrained muted labels.
-Keep clear spacing, compact technical labels, consistent corner radii and canvas-first hierarchy.
+Use square corners throughout app chrome, compact technical labels and canvas-first hierarchy.
+Panels sit flush against the workspace edges with 1-point seams and no outer gutters. Keep
+small insets only for controls, focus states and readable labels; do not add card-style panel
+padding. Shared density dimensions live in `PhotonTheme` so Perform, Map and loading states agree.
 Use the same native system text approach as that editor.
 The [Aidxn brand brain](../../aidxn-brand-brain/halls/components/rooms/cards-and-panels.md) is a
 secondary identity reference. Website typography and dashboard structure do not set desktop
@@ -96,6 +99,12 @@ editor visibility. Retained UI metadata is not a guarantee that a physical outpu
    See [integration review](engine-integration-review.md) before consuming the current cache.
 6. Replace fixture connection labels with authoritative runtime status when wiring the real
    provider. Keep unavailable telemetry absent and actual presentation misses observable.
+   **The CPU/GPU/Output readout is now live** (2026-10-13): `PhotonRender.FrameMeter` measures
+   it, `ProgramMetalView` (master role only) publishes into `PhotonUI.LiveTelemetryBus`, and
+   `LocalMediaWorkspaceProvider.telemetry()` reads it. Every metric is `Double?` end to end — an
+   unmeasured one stays `nil` and renders as "—", and nothing in that path substitutes a value.
+   `EngineTelemetry.unpresentedFrames` counts composited frames the display never showed, read
+   from `presentedTime == 0`; it is **not** a dropped-frame count.
 7. Preserve the existing performance contracts: coalesced UI observations, hidden-view suppression,
    bounded previews/thumbnails, no frame-loop path parsing and no synchronous GPU readback.
 

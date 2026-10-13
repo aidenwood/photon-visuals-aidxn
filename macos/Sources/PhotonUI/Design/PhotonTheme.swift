@@ -11,7 +11,13 @@ enum PhotonTheme {
     static let muted = Color(rgb: 0x9A9AAB)
     static let faint = Color(rgb: 0x6B6B7B)
     static let warning = Color(rgb: 0xFBBF24)
-    static let radius: CGFloat = 6
+    // Dense desktop chrome: flush square panels, hairline seams, control-only insets.
+    static let panelGap: CGFloat = 1
+    static let contentInset: CGFloat = 4
+    static let controlHeight: CGFloat = 22
+    static let panelHeaderHeight: CGFloat = 22
+    static let layerStripWidth: CGFloat = 208
+    static let deckBarHeight: CGFloat = 24
 }
 
 private extension Color {

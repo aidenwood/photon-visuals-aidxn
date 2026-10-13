@@ -19,13 +19,14 @@ extension PreviewWorkspaceProvider {
                 id: id, title: "Layer \(id.split(separator: "-").last ?? "")", opacity: layerOpacities[id] ?? 1,
                 bypass: bypassedLayers.contains(id), solo: soloLayers.contains(id),
                 activeClipID: activeClips[id],
-                slots: (0..<12).map { column in
-                    let clip = deck == "afterlight" ? Self.instances[Self.instanceID(layer: id, column: column)] : nil
+                blendMode: activeClips[id].flatMap { blendModes[$0] } ?? "Normal",
+                slots: (0..<columnCount).map { column in
+                    let clip = deck == "afterlight" ? instances[Self.instanceID(layer: id, column: column)] : nil
                     return ClipSlotSnapshot(id: "\(deck)-\(id)-\(column)", column: column, clip: clip)
                 }
             )
-        }, columns: 12, deckID: deck, decks: [
-            DeckDescriptor(id: "afterlight", title: "Afterlight"),
+        }, columns: columnCount, deckID: deck, decks: [
+            DeckDescriptor(id: "afterlight", title: deckTitle),
             DeckDescriptor(id: "empty", title: "Empty deck"),
         ])
     }
@@ -40,15 +41,15 @@ extension PreviewWorkspaceProvider {
         case let .triggerClip(clipID, layerID):
             try requireLayer(layerID)
             _ = try clip(clipID)
-            guard (0..<4).contains(where: { Self.instanceID(layer: layerID, column: $0) == clipID }) else {
+            guard (0..<populatedColumns).contains(where: { Self.instanceID(layer: layerID, column: $0) == clipID }) else {
                 throw invalidLiveAction()
             }
             activeClips[layerID] = clipID
             playing = true
         case let .triggerColumn(column, deckID):
-            guard (0..<12).contains(column) else { throw invalidLiveAction() }
+            guard (0..<columnCount).contains(column) else { throw invalidLiveAction() }
             guard deckID == nil || ["afterlight", "empty"].contains(deckID ?? "") else { throw invalidLiveAction() }
-            guard deckID != "empty", column < 4 else { return }
+            guard deckID != "empty", column < populatedColumns else { return }
             for id in Self.layerIDs {
                 activeClips[id] = Self.instanceID(layer: id, column: column)
             }

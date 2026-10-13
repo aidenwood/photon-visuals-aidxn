@@ -20,7 +20,7 @@ struct InspectorPanel: View {
         case .clip:
             PanelBoundary(model: model.inspector, retry: { model.reloadInspector() }) { snapshot in
                 ScrollView {
-                    InspectorContents(snapshot: snapshot,
+                    InspectorContents(model: model, snapshot: snapshot,
                         setOpacity: { model.setOpacity($0, clipID: snapshot.clip.id) },
                         setBlend: { model.setBlendMode($0, clipID: snapshot.clip.id) })
                         .id(snapshot.clip.id)

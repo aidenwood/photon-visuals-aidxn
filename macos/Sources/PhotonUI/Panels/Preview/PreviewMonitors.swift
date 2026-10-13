@@ -5,7 +5,7 @@ struct PreviewMonitors: View {
     let surface: ProgramSurfaceFactory?
 
     var body: some View {
-        VStack(spacing: 8) {
+        VStack(spacing: PhotonTheme.panelGap) {
             PreviewPanel(model: model, surface: surface, role: .master).frame(maxHeight: .infinity)
             PreviewPanel(model: model, surface: surface, role: .clip).frame(maxHeight: .infinity)
         }

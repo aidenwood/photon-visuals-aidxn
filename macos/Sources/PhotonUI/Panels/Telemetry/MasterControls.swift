@@ -4,7 +4,7 @@ struct MasterControls: View {
     @Bindable var model: WorkspaceModel
 
     var body: some View {
-        HStack(spacing: 10) {
+        HStack(spacing: 6) {
             Button { model.performanceLocked.toggle() } label: {
                 Label(model.performanceLocked ? "Locked" : "Lock", systemImage: model.performanceLocked ? "lock.fill" : "lock.open")
                     .font(.system(size: 10))
@@ -19,10 +19,10 @@ struct MasterControls: View {
             Button { model.toggleBlackout() } label: {
                 Text("BLACKOUT").font(.system(size: 9, weight: .semibold)).tracking(0.6)
                     .fixedSize(horizontal: true, vertical: false)
-                    .padding(.horizontal, 11).padding(.vertical, 7)
+                    .padding(.horizontal, 6).frame(height: PhotonTheme.controlHeight)
                     .background(
                         model.isBlackedOut ? Color.red.opacity(0.35) : PhotonTheme.raised,
-                        in: RoundedRectangle(cornerRadius: 4)
+                        in: Rectangle()
                     )
             }
             .buttonStyle(.plain)

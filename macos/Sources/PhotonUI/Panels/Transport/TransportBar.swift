@@ -10,20 +10,20 @@ struct TransportBar: View {
                 toggle: model.togglePlayback
             )
         } skeleton: {
-            HStack(spacing: 16) {
-                SkeletonBlock(width: 28, height: 28)
+            HStack(spacing: 8) {
+                SkeletonBlock(width: PhotonTheme.controlHeight, height: PhotonTheme.controlHeight)
                 SkeletonBlock(width: 80)
                 Spacer()
                 SkeletonBlock(width: 70)
             }
-            .padding(.horizontal, 14)
+            .padding(.horizontal, PhotonTheme.contentInset)
         }
-        .frame(height: 52)
-        .background(PhotonTheme.panel, in: RoundedRectangle(cornerRadius: PhotonTheme.radius))
+        .frame(height: 30)
+        .background(PhotonTheme.panel)
         .overlay {
-            RoundedRectangle(cornerRadius: PhotonTheme.radius).strokeBorder(PhotonTheme.border)
+            Rectangle().strokeBorder(PhotonTheme.border)
         }
-        .clipShape(RoundedRectangle(cornerRadius: PhotonTheme.radius))
+        .clipped()
         .accessibilityIdentifier(WorkspacePanelID.transport.accessibilityIdentifier)
     }
 }

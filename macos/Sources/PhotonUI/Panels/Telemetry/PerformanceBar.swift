@@ -4,7 +4,7 @@ struct PerformanceBar: View {
     let model: WorkspaceModel
 
     var body: some View {
-        HStack(spacing: 16) {
+        HStack(spacing: 8) {
             Text("AIDXN").font(.system(size: 9, weight: .semibold)).tracking(2)
                 .foregroundStyle(PhotonTheme.faint)
             Rectangle().fill(PhotonTheme.border).frame(width: 1, height: 12)
@@ -14,8 +14,9 @@ struct PerformanceBar: View {
             Spacer()
             TelemetryPanel(model: model.telemetry, retry: { model.reloadTelemetry() })
             .frame(width: 250, alignment: .trailing)
+            .liveTelemetryRefresh(model)
         }
-        .padding(.horizontal, 14).frame(height: 40)
+        .padding(.horizontal, PhotonTheme.contentInset).frame(height: 28)
         .background(PhotonTheme.panel)
         .overlay(alignment: .top) { Rectangle().fill(PhotonTheme.border).frame(height: 1) }
         .accessibilityIdentifier(WorkspacePanelID.masterStrip.accessibilityIdentifier)

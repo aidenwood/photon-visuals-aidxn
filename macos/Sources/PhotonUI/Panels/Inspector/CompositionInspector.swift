@@ -6,14 +6,16 @@ struct CompositionInspector: View {
     var body: some View {
         PanelBoundary(model: model.master, retry: { model.reloadMaster() }) { snapshot in
             ScrollView {
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("Afterlight").font(.system(size: 12, weight: .medium))
-                    Text("Preview composition").font(.system(size: 10)).foregroundStyle(PhotonTheme.muted)
-                    Divider().overlay(PhotonTheme.border)
-                    OpacityControl(value: snapshot.opacity, commit: model.setMasterOpacity)
-                    ParameterReadout(label: "Canvas", value: "1920 × 1080")
-                    ParameterReadout(label: "Blackout", value: snapshot.blackout ? "On" : "Off")
-                }.padding(10)
+                VStack(alignment: .leading, spacing: 1) {
+                    InspectorSection("Composition", detail: "Master", expanded: true) {
+                        OpacityControl(value: snapshot.opacity, commit: model.setMasterOpacity)
+                    }
+                    InspectorSection("Output", detail: "1920 × 1080") {
+                        ParameterReadout(label: "Canvas", value: "1920 × 1080")
+                        ParameterReadout(label: "Blackout", value: snapshot.blackout ? "On" : "Off")
+                    }
+                    EffectStackView(model: model, scope: .composition)
+                }
             }
         } skeleton: { InspectorSkeleton() }
     }

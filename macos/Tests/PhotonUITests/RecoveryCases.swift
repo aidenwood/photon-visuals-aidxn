@@ -7,11 +7,14 @@ enum UIRecoveryCase: String, CaseIterable, Sendable {
     case previewDimensions, duplicateIDs, controlValues, unknownTelemetry, malformedTelemetry, unknownID
     case gridSlots, commandCoalescing, commandLifetime, rapidBlackout
     case deckPlayback, clipInstances
+    case effectDropReachesRenderer, effectDropSelectsScope, effectDropRejectsUnknownKind
+    case effectClipChainOrder, effectRemovalClearsRenderer
 
     @MainActor func run() async throws {
         let panels = PanelModelTests()
         let data = SnapshotValidationTests()
         let controls = WorkspaceControlTests()
+        let effects = EffectDropTests()
         switch self {
         case .independentFailure: try await panels.oneFailureDoesNotReplaceAnotherPanelsData()
         case .retainedData: try await panels.refreshAndFailureRetainLastGoodData()
@@ -32,6 +35,11 @@ enum UIRecoveryCase: String, CaseIterable, Sendable {
         case .rapidBlackout: try await controls.rapidBlackoutPressesUseTheLatestRequestedState()
         case .deckPlayback: try await controls.browsingAnEmptyDeckKeepsPlayingClips()
         case .clipInstances: try await controls.clipInstancesHaveIndependentControlsForASharedAsset()
+        case .effectDropReachesRenderer: try await effects.aDropOnALayerReachesTheChainTheRendererReads()
+        case .effectDropSelectsScope: try await effects.aDropSelectsTheScopeItLandedIn()
+        case .effectDropRejectsUnknownKind: try await effects.anEffectTheEngineNeverPublishedIsRefused()
+        case .effectClipChainOrder: try await effects.clipEffectsRunBeforeTheLayersOwn()
+        case .effectRemovalClearsRenderer: try await effects.removingTheLastEffectClearsTheRenderersChain()
         }
     }
 }

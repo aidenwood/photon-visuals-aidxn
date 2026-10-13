@@ -6,11 +6,11 @@ struct PerformWorkspace: View {
 
     var body: some View {
         GeometryReader { geometry in
-            VStack(spacing: 8) {
+            VStack(spacing: PhotonTheme.panelGap) {
                 ClipMatrixPanel(model: model)
                     .frame(height: geometry.size.height * model.template.gridFraction)
                 TransportBar(model: model)
-                HStack(alignment: .top, spacing: 8) {
+                HStack(alignment: .top, spacing: PhotonTheme.panelGap) {
                     PreviewMonitors(model: model, surface: surface)
                         .frame(width: model.template == .preview ? min(420, geometry.size.width * 0.3) : 260)
                     InspectorPanel(model: model).frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -19,6 +19,5 @@ struct PerformWorkspace: View {
                 .frame(maxHeight: .infinity)
             }
         }
-        .padding(10)
     }
 }

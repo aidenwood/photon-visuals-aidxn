@@ -9,7 +9,7 @@ struct LayerControlRow: View {
     let solo: () -> Void
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 5) {
+        VStack(alignment: .leading, spacing: 2) {
             HStack(spacing: 5) {
                 Button(layer.title, action: select)
                     .buttonStyle(.plain).font(.system(size: 10, weight: .medium))
@@ -18,12 +18,12 @@ struct LayerControlRow: View {
                 layerButton("B", active: layer.bypass, help: "Bypass \(layer.title)", action: bypass)
                 layerButton("S", active: layer.solo, help: "Solo \(layer.title)", action: solo)
             }
-            HStack(spacing: 8) {
+            HStack(spacing: 4) {
                 Text("Normal").font(.system(size: 9)).foregroundStyle(PhotonTheme.muted)
                 LiveFader(value: layer.opacity, label: "\(layer.title) opacity", change: opacity)
             }
         }
-        .padding(.horizontal, 10).padding(.vertical, 7)
+        .padding(PhotonTheme.contentInset)
         .frame(maxHeight: .infinity, alignment: .center)
         .background(PhotonTheme.panel)
         .overlay { Rectangle().strokeBorder(selected ? PhotonTheme.accent.opacity(0.6) : PhotonTheme.border) }
