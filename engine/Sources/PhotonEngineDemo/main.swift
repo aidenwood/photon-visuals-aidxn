@@ -46,6 +46,9 @@ final class DemoView: NSView {
     private init(device d: MTLDevice, engine e: PhotonEngine) {
         self.device = d
         self.engine = e
+        // Opted in here, not defaulted on in the engine — this is the one place
+        // the drifting-layer sweep is actually wanted. Space toggles it.
+        e.animateTransforms = true
         super.init(frame: NSRect(x: 0, y: 0, width: 1280, height: 720))
         wantsLayer = true
         mediaURLs = Self.findMedia()

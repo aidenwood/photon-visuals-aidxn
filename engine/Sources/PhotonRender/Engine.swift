@@ -159,8 +159,14 @@ public final class PhotonEngine: @unchecked Sendable {
     public var masterOpacity: Float = 1
     /// Explicit operator blackout. Never set implicitly by decode failure.
     public var blackout: Bool = false
-    /// Animate layer transforms — useful for a demo, off for real playback.
-    public var animateTransforms: Bool = true
+    /// Animate layer transforms with a sine sweep — a demo flourish only.
+    ///
+    /// **Defaults off.** It used to default on, which meant every consumer that
+    /// did not know to switch it off — including the app's own preview — showed
+    /// layers drifting and scaling on their own, looking like a bug in playback.
+    /// A demo behaviour must be opted into by the demo, not opted out of by
+    /// everything else.
+    public var animateTransforms: Bool = false
 
     /// When set, the composite is replaced by a full-screen test pattern.
     ///
