@@ -77,10 +77,44 @@ Every entry point tolerates a null handle and returns an empty frame rather than
 bug must not take the process down mid-show — the same reasoning as holding the last valid frame
 when a source is late.
 
+## 🔶 [DECISION] DXV decode crosses here, and it crosses as BLOCKS
+
+Added 2026-10-13. `photon_dxv_decode` takes one compressed DXV frame and returns a pointer to
+BC1/BC3 **blocks** — not pixels, ever.
+
+- **Why in the core at all.** The LZ layer is pure portable CPU work over a byte slice. Writing it
+  shell-side would mean writing it twice, once in Swift and once again for Windows, and a second
+  byte-exact implementation of a reverse-engineered format is the drift this crate exists to
+  prevent. `codec/mod.rs` carries the full reasoning, including the "no decompression" line it
+  amends.
+- **Why blocks and not RGBA.** DXV frames are *already* GPU block-compressed; that is the entire
+  reason a Resolume library is in DXV. FFmpeg's own DXV decoder outputs RGBA, so linking it would
+  have been less code and would have cost 4x the upload bandwidth and 4x the texture memory on
+  every layer, every frame. A 4K DXT5 frame is 8.3 MB as blocks and 33 MB as RGBA.
+- **Why a handle rather than a free function.** The decoder owns the output buffer, so a steady
+  state does no allocation. One decoder per layer, because DXV has no chunk table: a frame is one
+  contiguous LZ stream and cannot be split across workers. Parallelism is across layers.
+
+**Lifetime:** `PhotonDxvFrame.data` is valid until the next `photon_dxv_decode` on the same
+decoder. Same rule as `photon_tick`, same reason.
+
+**Two fields the shell must not ignore**, both of which fail by looking plausible:
+
+- `texture_width`/`texture_height` are **padded** (width to 16, height to 4). The visible frame is
+  the top-left crop. And the crop must clamp the sample coordinate, not merely scale it — with
+  linear filtering the last visible column otherwise interpolates against the padding.
+- `premultiplied` means the sampler must compute `min(1, c / a)`, passing `c` through where
+  `a == 0`. Skip it and every real Resolume DXT5 clip renders visibly dark.
+
+`YCG6`/`YG10` and DXV1 return `PHOTON_DXV_NOT_DERIVED` with a readable reason rather than a guess.
+
 ## Reproduce
 
 ```
-cd photon-ffi && cargo test                      # 9 tests, incl. clock crossing correctness
+cd photon-ffi && cargo test                      # incl. clock crossing correctness and DXV
 cd photon-ffi && cargo run --release --bin ffi_bench
+
+# DXV decode vs FFmpeg, byte for byte, on real files:
+cd photon-ffi && cargo run --release --bin dxv_verify -- --frames 6 --list clips.txt
 # Swift-side benchmark: see NIGHT-LOG for the swiftc invocation
 ```

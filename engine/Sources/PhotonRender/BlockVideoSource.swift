@@ -49,6 +49,7 @@ public final class BlockVideoSource: FrameSource, @unchecked Sendable {
     public private(set) var repeatedFrames: Int = 0
     public private(set) var textureScale = SIMD2<Float>(1, 1)
     public private(set) var isPremultiplied = false
+    public private(set) var isOpaque = false
 
     /// Visible frame size. The texture may be larger — see `textureScale`.
     public let width: Int
@@ -69,8 +70,15 @@ public final class BlockVideoSource: FrameSource, @unchecked Sendable {
     private var ring: [MTLTexture] = []
     private var ringCursor = 0
 
-    private let lock = NSLock()
-    private let slots = DispatchSemaphore(value: BlockVideoSource.queueBound)
+    /// Guards everything shared between the decode thread and the render
+    /// thread, and is also how the render thread tells the decoder there is
+    /// room for another frame.
+    ///
+    /// A `DispatchSemaphore` would read more naturally here and is the wrong
+    /// tool: dispatch traps if one is deallocated while its count sits below
+    /// where it started, so a source dropped mid-show with frames still queued
+    /// would take the process down. A condition has no such balance to keep.
+    private let lock = NSCondition()
     private var ready: [(pts: Double, texture: MTLTexture)] = []
     private var pendingRestart = false
     private var stopped = false
@@ -80,7 +88,6 @@ public final class BlockVideoSource: FrameSource, @unchecked Sendable {
     /// Clip-time position in seconds, advanced by the render thread.
     private var position: Double = 0
     private var lastHostTime: CFTimeInterval?
-    private var held: MTLTexture?
 
     init?(probe: MediaProbe, url: URL, device: MTLDevice) {
         self.url = url
@@ -122,13 +129,10 @@ public final class BlockVideoSource: FrameSource, @unchecked Sendable {
             while let first = ready.first, first.pts <= position {
                 picked = first.texture
                 ready.removeFirst()
-                slots.signal()
             }
+            if picked != nil { lock.signal() }
         }
-        if let picked {
-            held = picked
-            return picked
-        }
+        if let picked { return picked }
         repeatedFrames += 1
         return nil
     }
@@ -194,12 +198,14 @@ public final class BlockVideoSource: FrameSource, @unchecked Sendable {
     /// One pass of the decode loop. Returns `false` when the thread should end.
     private func decodeStep(decoder: OpaquePointer,
                             reader: inout (AVAssetReader, AVAssetReaderTrackOutput)?) -> Bool {
-        if lock.withLock({ stopped }) { return false }
-        let restart = lock.withLock { () -> Bool in
-            let r = pendingRestart
+        var stop = false
+        var restart = false
+        lock.withLock {
+            stop = stopped
+            restart = pendingRestart
             pendingRestart = false
-            return r
         }
+        if stop { return false }
         if restart || reader == nil {
             reader?.0.cancelReading()
             flushQueued()
@@ -207,16 +213,22 @@ public final class BlockVideoSource: FrameSource, @unchecked Sendable {
         }
         guard let (r, output) = reader else { return false }
 
-        // Timed, so the thread releases its strong reference regularly even
-        // when nothing is consuming frames.
-        guard slots.wait(timeout: .now() + 0.1) == .success else { return true }
-        if lock.withLock({ stopped }) {
-            slots.signal()
-            return false
+        // Backpressure. The wait is timed so this thread releases its strong
+        // reference to `self` regularly even when nothing is consuming frames —
+        // otherwise every source a show ever launched would stay alive, each
+        // holding a 4-deep ring of 4K textures.
+        var room = false
+        lock.lock()
+        if ready.count >= Self.queueBound && !stopped && !pendingRestart {
+            _ = lock.wait(until: Date().addingTimeInterval(0.05))
         }
+        room = ready.count < Self.queueBound
+        stop = stopped
+        lock.unlock()
+        if stop { return false }
+        if !room { return true }
 
         guard let sample = output.copyNextSampleBuffer() else {
-            slots.signal()
             if r.status == .failed {
                 report("read failed: \(r.error?.localizedDescription ?? "unknown")")
                 return false
@@ -229,7 +241,6 @@ public final class BlockVideoSource: FrameSource, @unchecked Sendable {
         }
 
         guard let texture = decode(sample, with: decoder) else {
-            slots.signal()
             // A decode failure is terminal for the clip; a marker sample
             // buffer with no payload is not.
             return failure == nil
@@ -245,10 +256,7 @@ public final class BlockVideoSource: FrameSource, @unchecked Sendable {
     /// in front of frames from the start, and playback stalls until the
     /// position crawls back past them.
     private func flushQueued() {
-        lock.withLock {
-            for _ in ready { slots.signal() }
-            ready.removeAll(keepingCapacity: true)
-        }
+        lock.withLock { ready.removeAll(keepingCapacity: true) }
     }
 
     private func startFraction() -> Double {
@@ -307,7 +315,8 @@ public final class BlockVideoSource: FrameSource, @unchecked Sendable {
             // in front of an audience, which is strictly worse than a clip that
             // refuses to load.
             report(frame.status == PHOTON_DXV_NOT_DERIVED
-                   ? "DXV variant not supported (\(why)) — re-encode as DXV3 DXT1/DXT5"
+                   ? "\(fourCCString(probe.subType)) variant not supported (\(why)) — "
+                     + "re-encode as DXV3 DXT1/DXT5"
                    : "decode failed: \(why)")
             return nil
         }
@@ -341,6 +350,7 @@ public final class BlockVideoSource: FrameSource, @unchecked Sendable {
 
         textureScale = SIMD2(Float(width) / Float(tw), Float(height) / Float(th))
         isPremultiplied = frame.premultiplied != 0
+        isOpaque = pixelFormat == .bc1_rgba
         return texture
     }
 

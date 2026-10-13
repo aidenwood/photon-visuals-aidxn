@@ -470,6 +470,7 @@ public final class PhotonEngine: @unchecked Sendable {
                     texSlot = Int32(slot)
                     texScale = src.textureScale
                     if src.isPremultiplied { flags |= LayerUniform.flagPremultiplied }
+                    if src.isOpaque { flags |= LayerUniform.flagOpaque }
                 }
             }
 

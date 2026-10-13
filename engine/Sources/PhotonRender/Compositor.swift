@@ -89,6 +89,7 @@ public struct LayerUniform {
     /// down its right-hand edge.
     public var texScale: SIMD2<Float>
     /// Bit 0: the texture's RGB is premultiplied by its alpha.
+    /// Bit 1: the texture has no alpha channel; ignore what it samples.
     public var flags: Int32
     /// Keeps the struct's stride equal to the shader's. Not read by anything.
     private var reserved: Int32 = 0
@@ -96,6 +97,12 @@ public struct LayerUniform {
     /// Bit 0 of `flags`. DXV stores premultiplied RGB and the sampler has to
     /// divide it back out; skip it and every Resolume DXT5 clip renders dark.
     public static let flagPremultiplied: Int32 = 1
+
+    /// Bit 1 of `flags`. Metal has no `bc1_rgb`, so a DXV DXT1 clip is uploaded
+    /// as `bc1_rgba` and the hardware reads index 3 of a `c0 <= c1` block as
+    /// transparent. DXT1 has no alpha, so the sampled value is meaningless and
+    /// honouring it punches holes in the layer.
+    public static let flagOpaque: Int32 = 2
 
     public init(tint: SIMD4<Float>, offsetScale: SIMD4<Float>,
                 opacity: Float, blend: BlendMode, kind: Int32, texSlot: Int32 = -1,
@@ -297,8 +304,9 @@ public final class Compositor: @unchecked Sendable {
         int    reserved;
     };
 
-    // Bit 0 of LayerUniform.flags. Mirrors LayerUniform.flagPremultiplied.
+    // Mirrors LayerUniform.flagPremultiplied / .flagOpaque.
     constant int FLAG_PREMULTIPLIED = 1;
+    constant int FLAG_OPAQUE        = 2;
 
     vertex float4 fullscreen_vertex(uint id [[vertex_id]]) {
         float2 p = float2((id << 1) & 2, id & 2);
@@ -400,6 +408,7 @@ public final class Compositor: @unchecked Sendable {
                 float2 uvp = clamp(float2(p.x, 1.0 - p.y) * L.texScale,
                                    half_texel, L.texScale - half_texel);
                 float4 c = texs[L.texSlot].sample(vs, uvp);
+                if (L.flags & FLAG_OPAQUE) { c.a = 1.0; }
                 if (L.flags & FLAG_PREMULTIPLIED) {
                     // DXV stores RGB multiplied by alpha. Undo it exactly as
                     // photon_core::codec::dxv::unpremultiply does, including

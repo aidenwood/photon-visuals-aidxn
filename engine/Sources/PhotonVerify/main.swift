@@ -1905,15 +1905,15 @@ do {
          UInt8(rgb565 & 0xFF), UInt8(rgb565 >> 8), 0, 0, 0, 0, 0, 0]
     }
 
-    @MainActor func renderTextured(_ layer: LayerUniform, _ tex: MTLTexture) -> [UInt8] {
+    @MainActor func renderStack(_ layers: [LayerUniform], _ textures: [MTLTexture?]) -> [UInt8] {
         let td = MTLTextureDescriptor.texture2DDescriptor(
             pixelFormat: .bgra8Unorm_srgb, width: SIZE, height: SIZE, mipmapped: false)
         td.usage = [.renderTarget, .shaderRead]
         td.storageMode = .shared
         guard let output = device.makeTexture(descriptor: td),
               let cb = compositor.makeCommandBuffer() else { return [] }
-        let work = compositor.composite(into: cb, layers: [layer], time: 0,
-                                        width: SIZE, height: SIZE, textures: [tex])
+        let work = compositor.composite(into: cb, layers: layers, time: 0,
+                                        width: SIZE, height: SIZE, textures: textures)
         let rp = MTLRenderPassDescriptor()
         rp.colorAttachments[0].texture = output
         rp.colorAttachments[0].loadAction = .clear
@@ -1933,10 +1933,15 @@ do {
         return p
     }
 
-    func videoLayer(texScale: SIMD2<Float> = SIMD2(1, 1), flags: Int32 = 0) -> LayerUniform {
+    func videoLayer(texScale: SIMD2<Float> = SIMD2(1, 1), flags: Int32 = 0,
+                    slot: Int32 = 0) -> LayerUniform {
         LayerUniform(tint: .init(1, 1, 1, 1), offsetScale: .init(0, 0, 1, 1),
-                     opacity: 1, blend: .over, kind: 3, texSlot: 0,
+                     opacity: 1, blend: .over, kind: 3, texSlot: slot,
                      texScale: texScale, flags: flags)
+    }
+
+    @MainActor func renderTextured(_ layer: LayerUniform, _ tex: MTLTexture) -> [UInt8] {
+        renderStack([layer], [tex])
     }
 
     check("this GPU can sample BC textures at all", device.supportsBCTextureCompression)
@@ -1970,7 +1975,34 @@ do {
         check("BC3 texture allocates", false)
     }
 
-    // 3. Padding. A 1366-wide DXV clip lives in a 1376-wide texture; the extra
+    // 3. BC1 has no alpha, but Metal has no bc1_rgb. In a block with
+    //    c0 <= c1, index 3 reads as TRANSPARENT from the hardware and as
+    //    opaque black from FFmpeg's DXV decoder. Over black the two look
+    //    identical, which is why this needs a layer underneath to catch:
+    //    without the opaque flag a DXT1 clip goes see-through in patches.
+    do {
+        // c0 = 0x0000 <= c1 = 0xFFFF selects the 3-colour branch; all indices
+        // are 3, the texel the hardware calls transparent.
+        let block: [UInt8] = [0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]
+        if let tex = blockTexture(Array(repeating: block, count: 4).flatMap { $0 },
+                                  format: .bc1_rgba, width: 16, height: 4) {
+            // Red underneath, so a hole is visible rather than merely black.
+            let under = solid(.init(1, 0, 0, 1))
+            let holed = px(renderStack([under, videoLayer(slot: 1)], [nil, tex]),
+                           SIZE / 2, SIZE / 2)
+            let covered = px(renderStack(
+                [under, videoLayer(flags: LayerUniform.flagOpaque, slot: 1)], [nil, tex]),
+                             SIZE / 2, SIZE / 2)
+            check("a DXT1 layer stays opaque where the hardware would punch through",
+                  covered.r < 20, "centre BGR=\(covered)")
+            check("…and the hardware really would have let red through",
+                  holed.r > 180, "centre BGR=\(holed)")
+        } else {
+            check("3-colour BC1 texture allocates", false)
+        }
+    }
+
+    // 4. Padding. A 1366-wide DXV clip lives in a 1376-wide texture; the extra
     //    blocks hold whatever the encoder left there. Here the right-hand half
     //    is green and must never be sampled.
     let split = (Array(repeating: bc1Block(0xF800), count: 4)

@@ -48,6 +48,16 @@ public protocol FrameSource: AnyObject {
     /// must divide it back out. True for DXV's DXT5.
     var isPremultiplied: Bool { get }
 
+    /// Whether the source has no alpha channel and the sampled alpha must be
+    /// ignored.
+    ///
+    /// Metal has no `bc1_rgb`, only `bc1_rgba`, and in a BC1 block with
+    /// `c0 <= c1` the hardware reads palette index 3 as **transparent**. DXV's
+    /// DXT1 carries no alpha, and FFmpeg decodes that same texel as opaque
+    /// black. Left alone the two disagree, and the symptom is a DXT1 layer
+    /// going see-through in patches once something is underneath it.
+    var isOpaque: Bool { get }
+
     /// The texture for this host time, or `nil` if no new frame is ready.
     ///
     /// `nil` means **hold the previous frame**, never stall. A late source must
@@ -61,6 +71,7 @@ public protocol FrameSource: AnyObject {
 public extension FrameSource {
     var textureScale: SIMD2<Float> { SIMD2(1, 1) }
     var isPremultiplied: Bool { false }
+    var isOpaque: Bool { false }
 }
 
 // MARK: - Choosing one
@@ -92,6 +103,11 @@ public func fourCC(_ s: String) -> FourCharCode {
     return v
 }
 
+/// Renders a four-character code for an operator-facing message.
+///
+/// Worth having because `DXDI` and `DXD3` refuse for different reasons — DXV1
+/// versus a YCoCg variant — and "re-encode this clip" is a different amount of
+/// work depending which.
 public func fourCCString(_ v: FourCharCode) -> String {
     String(bytes: [UInt8((v >> 24) & 0xFF), UInt8((v >> 16) & 0xFF),
                    UInt8((v >> 8) & 0xFF), UInt8(v & 0xFF)], encoding: .ascii) ?? "????"
