@@ -12,21 +12,36 @@
 import Metal
 import simd
 
+/// Layer blend modes.
+///
+/// ⚠️ **These raw values are a shared ABI with `photon-core`'s `BlendMode` and
+/// with the `switch` in `blend_rgb` below. All three must agree exactly.**
+///
+/// They did not. `subtract` was missing here while present in the Rust model at
+/// 8, so every mode above it was shifted by one: a document saying `Subtract`
+/// rendered as Lighten, `Lighten` rendered as Darken, and `Darken` — raw value
+/// 10 — had no case at all and ran off the end of the name array. That is a
+/// crash, from opening a perfectly valid show file. Found 2026-10-13 by
+/// diffing the two enums rather than by anything failing, which is the
+/// problem: nothing here is checked against the core at build time.
 public enum BlendMode: Int32, CaseIterable, Sendable {
-    case over = 0, add, multiply, screen, difference, mask, overlay, hardLight, lighten, darken
+    case over = 0, add, multiply, screen, difference, mask, overlay, hardLight,
+         subtract, lighten, darken
 
     public var name: String {
         ["Over", "Add", "Multiply", "Screen", "Difference", "Mask",
-         "Overlay", "Hard Light", "Lighten", "Darken"][Int(rawValue)]
+         "Overlay", "Hard Light", "Subtract", "Lighten", "Darken"][Int(rawValue)]
     }
 
     /// Whether this mode must read what's underneath it.
     /// `false` means fixed-function blending could express it; one `true`
     /// anywhere in the stack forces the folded path for the whole stack.
+    ///
+    /// Mirrors `BlendMode::needs_destination` in `photon-core`.
     public var needsDestination: Bool {
         switch self {
         case .over, .add, .multiply, .screen, .lighten, .darken: return false
-        case .difference, .mask, .overlay, .hardLight: return true
+        case .difference, .mask, .overlay, .hardLight, .subtract: return true
         }
     }
 }
@@ -79,8 +94,9 @@ public struct LayerUniform {
 }
 
 public final class Compositor: @unchecked Sendable {
-    // Only mutable state crossing threads is `lastGPUTime`, a single Double
-    // written from the completion handler and read for display. Benign.
+    // No mutable state crosses threads here. Frame timing belongs to
+    // `FrameMeter` — one owner, so a number can never be measured two ways and
+    // disagree with itself.
 
     public static let maxLayers = 32
 
@@ -94,7 +110,10 @@ public final class Compositor: @unchecked Sendable {
     private var workTarget: MTLTexture?
     private var encodePipeline: MTLRenderPipelineState!
 
-    public private(set) var lastGPUTime: Double = 0
+    /// Where this compositor's own command buffers report their GPU time.
+    /// Set by `PhotonEngine`; `nil` for a standalone compositor (the GPU
+    /// verification harness), where there is nothing to report to.
+    public var meter: FrameMeter?
 
     public init?(device: MTLDevice) {
         guard let q = device.makeCommandQueue() else { return nil }
@@ -185,13 +204,6 @@ public final class Compositor: @unchecked Sendable {
     /// Creates a command buffer for callers that drive compositing themselves.
     public func makeCommandBuffer() -> MTLCommandBuffer? { queue.makeCommandBuffer() }
 
-    /// Records GPU time from a completed buffer. Call once per presented frame.
-    public func noteCompletion(_ cb: MTLCommandBuffer) {
-        cb.addCompletedHandler { [weak self] b in
-            self?.lastGPUTime = b.gpuEndTime - b.gpuStartTime
-        }
-    }
-
     /// Renders the stack straight to `drawable`, unwarped.
     public func render(layers: [LayerUniform], time: Float,
                        drawable: MTLDrawable, output: MTLTexture,
@@ -239,9 +251,7 @@ public final class Compositor: @unchecked Sendable {
             enc.endEncoding()
         }
 
-        cb.addCompletedHandler { [weak self] b in
-            self?.lastGPUTime = b.gpuEndTime - b.gpuStartTime
-        }
+        meter?.observe(cb)
         cb.present(drawable)
         cb.commit()
     }
@@ -330,8 +340,9 @@ public final class Compositor: @unchecked Sendable {
             case 5:  return dst * src;                                  // mask (luma of src gates dst)
             case 6:  return select(2.0*dst*src, 1.0-2.0*(1.0-dst)*(1.0-src), dst > 0.5); // overlay
             case 7:  return select(2.0*dst*src, 1.0-2.0*(1.0-dst)*(1.0-src), src > 0.5); // hard light
-            case 8:  return max(dst, src);                              // lighten
-            case 9:  return min(dst, src);                              // darken
+            case 8:  return max(dst - src, 0.0);                        // subtract
+            case 9:  return max(dst, src);                              // lighten
+            case 10: return min(dst, src);                              // darken
             default: return src;                                        // over
         }
     }
