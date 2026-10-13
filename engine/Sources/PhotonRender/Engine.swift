@@ -480,7 +480,14 @@ public final class PhotonEngine: @unchecked Sendable {
                 for (slot, st) in active.enumerated() where !st.effects.isEmpty {
                     guard slot < boundTextures.count,
                           let input = boundTextures[slot] else { continue }
-                    let out = fx.apply(st.effects, to: input, in: cb)
+                    // The clock MUST be threaded through here. Both arguments
+                    // default to 0, and with the defaults taken every
+                    // time-varying effect is frozen in the real engine while
+                    // looking perfectly correct in the verifier, which passes
+                    // the clock explicitly. Strobe, noise and wave sat dead
+                    // still on stage and nothing failed anywhere.
+                    let out = fx.apply(st.effects, to: input, in: cb,
+                                       time: t, beat: beat)
                     if out !== input {
                         boundTextures[slot] = out
                         effected += 1
