@@ -579,6 +579,96 @@ do {
           EffectKind.blur.isNeighbourhood && !EffectKind.invert.isNeighbourhood)
     check("pass count is reported for telemetry", chain.passesLastFrame == 2,
           "got \(chain.passesLastFrame)")
+
+    // Every kind the browser offers must actually do something.
+    //
+    // This check exists because it did not: `EffectKind` grew from 6 cases to 35
+    // while the Metal switch kept the ORIGINAL six-case numbering. The raw values
+    // silently re-pointed — `levels` ran blur, `invert` ran rgbShift — and the 29
+    // kinds past the end fell to `default`, which is a passthrough. An operator
+    // would have picked an effect from the list and seen nothing happen, with no
+    // error anywhere. A shader `switch` on a raw value has no compiler to tell it
+    // a case is missing, so the test has to be the compiler.
+    //
+    // The source is deliberately asymmetric in both axes and fully coloured:
+    // a mirrored or hue-rotated version of a symmetric grey image can equal the
+    // original, which would read as "not implemented" and be a false failure.
+    let probeDesc = MTLTextureDescriptor.texture2DDescriptor(
+        pixelFormat: .rgba16Float, width: SIZE, height: SIZE, mipmapped: false)
+    probeDesc.usage = [.renderTarget, .shaderRead]
+    probeDesc.storageMode = .shared
+    let probe = device.makeTexture(descriptor: probeDesc)!
+    var pp = [Float16](repeating: 0, count: SIZE * SIZE * 4)
+    for y in 0..<SIZE { for x in 0..<SIZE {
+        let fx = Float(x) / Float(SIZE), fy = Float(y) / Float(SIZE)
+        let i = (y * SIZE + x) * 4
+        // Fine checker on top of the gradient. Without local detail an unsharp
+        // mask is a genuine no-op — a smooth ramp has nothing to sharpen — and
+        // the kind would read as unimplemented when it is simply well behaved.
+        let d: Float = ((x / 4) + (y / 4)) % 2 == 0 ? 0.12 : -0.12
+        pp[i]   = Float16(max(0, 0.15 + 0.8 * fx + d))
+        pp[i+1] = Float16(max(0, 0.10 + 0.7 * fy * fx + d))
+        pp[i+2] = Float16(max(0, 0.90 - 0.6 * fy + d))
+        pp[i+3] = 1
+    }}
+    pp.withUnsafeBytes { buf in
+        probe.replace(region: MTLRegionMake2D(0, 0, SIZE, SIZE), mipmapLevel: 0,
+                      withBytes: buf.baseAddress!, bytesPerRow: SIZE * 8)
+    }
+
+    func rgba(_ tex: MTLTexture, _ x: Int, _ y: Int) -> [Float] {
+        let readable: MTLTexture
+        if tex.storageMode == .shared {
+            readable = tex
+        } else {
+            guard let cb = compositor.makeCommandBuffer(),
+                  let blit = cb.makeBlitCommandEncoder() else { return [.nan] }
+            blit.copy(from: tex, sourceSlice: 0, sourceLevel: 0,
+                      sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
+                      sourceSize: MTLSize(width: SIZE, height: SIZE, depth: 1),
+                      to: stage, destinationSlice: 0, destinationLevel: 0,
+                      destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0))
+            blit.endEncoding()
+            cb.commit(); cb.waitUntilCompleted()
+            readable = stage
+        }
+        var px = [Float16](repeating: 0, count: 4)
+        px.withUnsafeMutableBytes { b in
+            readable.getBytes(b.baseAddress!, bytesPerRow: 8,
+                              from: MTLRegionMake2D(x, y, 1, 1), mipmapLevel: 0)
+        }
+        return px.map(Float.init)
+    }
+
+    // `beat` is non-zero on purpose: strobe gates on musical phase, and at beat 0
+    // it is legitimately open, which would look like a missing implementation.
+    func applyOne(_ kind: EffectKind) -> MTLTexture {
+        let cb = compositor.makeCommandBuffer()!
+        let out = chain.apply([Effect(kind: kind, amount: 0.8, param: 0.35)],
+                              to: probe, in: cb, time: 0.37, beat: 2.0)
+        cb.commit(); cb.waitUntilCompleted()
+        return out
+    }
+
+    var deadKinds: [String] = []
+    for kind in EffectKind.allCases {
+        let out = applyOne(kind)
+
+        var changed = false
+        for gy in stride(from: SIZE / 8, to: SIZE, by: SIZE / 4) {
+            for gx in stride(from: SIZE / 8, to: SIZE, by: SIZE / 4) {
+                let a = rgba(probe, gx, gy), b = rgba(out, gx, gy)
+                for ch in 0..<4 where abs(a[ch] - b[ch]) > 0.002 { changed = true }
+            }
+        }
+        if !changed { deadKinds.append(kind.name) }
+    }
+    check("every effect kind is implemented in the shader", deadKinds.isEmpty,
+          "these did nothing: \(deadKinds.joined(separator: ", "))")
+
+    check("effect kind count matches the shader's case range",
+          EffectKind.allCases.count == 35,
+          "\(EffectKind.allCases.count) kinds — the shader switch covers 0...34")
 }
 
 

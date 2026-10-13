@@ -345,13 +345,17 @@ public final class EffectChain {
     #include <metal_stdlib>
     using namespace metal;
 
+    // Field order and offsets must match the Swift `EffectUniforms` exactly.
+    // `time` and `beat` were previously named `pad`/`pad2` here, so every
+    // free-running or tempo-locked effect silently read nothing.
     struct EffectUniforms {
-        float  amount;
-        float  param;
-        int    kind;
-        float  pad;
-        float2 resolution;
-        float2 pad2;
+        float  amount;      // 0
+        float  param;       // 4
+        int    kind;        // 8
+        float  time;        // 12
+        float2 resolution;  // 16
+        float  beat;        // 24
+        float  pad;         // 28
     };
 
     vertex float4 effect_vertex(uint id [[vertex_id]]) {
@@ -359,6 +363,50 @@ public final class EffectChain {
         return float4(p * 2.0 - 1.0, 0.0, 1.0);
     }
 
+    constant float TAU = 6.283185307;
+
+    static inline float luma709(float3 c) {
+        return dot(c, float3(0.2126, 0.7152, 0.0722));
+    }
+
+    // Rodrigues rotation about the grey axis — hue without a full HSV round trip.
+    static inline float3 hueShift(float3 c, float h) {
+        const float3 k = float3(0.57735027);
+        float ca = cos(h), sa = sin(h);
+        return c * ca + cross(k, c) * sa + k * dot(k, c) * (1.0 - ca);
+    }
+
+    static inline float3 hsv2rgb(float3 c) {
+        float4 K = float4(1.0, 2.0 / 3.0, 1.0 / 3.0, 3.0);
+        float3 p = abs(fract(c.xxx + K.xyz) * 6.0 - K.www);
+        return c.z * mix(K.xxx, clamp(p - K.xxx, 0.0, 1.0), c.y);
+    }
+
+    static inline float hash21(float2 p) {
+        p = fract(p * float2(443.897, 441.423));
+        p += dot(p, p + 19.19);
+        return fract((p.x + p.y) * p.x);
+    }
+
+    // A 5x5 gaussian used by blur, glow and sharpen. Radius in texels.
+    static inline float4 gauss25(texture2d<float> src, sampler sm,
+                                 float2 uv, float2 texel, float r) {
+        float4 sum = float4(0.0);
+        float wsum = 0.0;
+        for (int y = -2; y <= 2; ++y) {
+            for (int x = -2; x <= 2; ++x) {
+                float w = exp(-float(x * x + y * y) * 0.3);
+                sum += src.sample(sm, uv + float2(x, y) * texel * r) * w;
+                wsum += w;
+            }
+        }
+        return sum / max(wsum, 1e-5);
+    }
+
+    // The `case` numbers below are `EffectKind.rawValue` and nothing else.
+    // They are asserted against Swift by `every effect kind is implemented` in
+    // PhotonVerify — a kind that falls through to `default` is a bug, not a
+    // placeholder, because the browser offers it to the operator regardless.
     fragment float4 effect_fragment(float4 pos [[position]],
                                     constant EffectUniforms &u [[buffer(0)]],
                                     texture2d<float> src [[texture(0)]])
@@ -366,55 +414,231 @@ public final class EffectChain {
         constexpr sampler sm(filter::linear, address::clamp_to_edge);
         float2 uv = pos.xy / u.resolution;
         float2 texel = 1.0 / u.resolution;
+        float  a = u.amount;
+        float  p = u.param;
 
         switch (u.kind) {
-            case 0: {   // blur — separable-ish 9 tap, cheap and good enough
-                float r = u.amount * 8.0;
-                float4 sum = float4(0.0);
-                float wsum = 0.0;
-                for (int y = -2; y <= 2; ++y) {
-                    for (int x = -2; x <= 2; ++x) {
-                        float w = exp(-float(x*x + y*y) * 0.3);
-                        sum += src.sample(sm, uv + float2(x, y) * texel * r) * w;
-                        wsum += w;
-                    }
+
+        // ---- Colour: operate on the pixel where it is ----
+        case 0: {   // levels — contrast about mid-grey, then gamma
+            float4 c = src.sample(sm, uv);
+            float3 v = (c.rgb - 0.5) * (1.0 + a * 3.0) + 0.5;
+            v = pow(max(v, 0.0), float3(mix(0.4, 2.5, p)));
+            return float4(v, c.a);
+        }
+        case 1: {   // invert
+            float4 c = src.sample(sm, uv);
+            return float4(mix(c.rgb, 1.0 - c.rgb, a), c.a);
+        }
+        case 2: {   // saturation — 0.5 is identity, 0 greyscale, 1 double
+            float4 c = src.sample(sm, uv);
+            return float4(mix(float3(luma709(c.rgb)), c.rgb, a * 2.0), c.a);
+        }
+        case 3: {   // hue rotate — param picks the angle, amount mixes
+            float4 c = src.sample(sm, uv);
+            return float4(mix(c.rgb, saturate(hueShift(c.rgb, p * TAU)), a), c.a);
+        }
+        case 4: {   // colorize — luma tinted by a hue
+            float4 c = src.sample(sm, uv);
+            float3 t = hsv2rgb(float3(p, 1.0, 1.0)) * luma709(c.rgb);
+            return float4(mix(c.rgb, t, a), c.a);
+        }
+        case 5: {   // duotone — luma ramped between complementary hues
+            float4 c = src.sample(sm, uv);
+            float3 lo = hsv2rgb(float3(p, 0.9, 0.25));
+            float3 hi = hsv2rgb(float3(fract(p + 0.5), 0.7, 1.0));
+            return float4(mix(c.rgb, mix(lo, hi, luma709(c.rgb)), a), c.a);
+        }
+        case 6: {   // threshold — amount IS the cut point
+            float4 c = src.sample(sm, uv);
+            return float4(float3(step(a, luma709(c.rgb))), c.a);
+        }
+        case 7: {   // posterize — param sets the step count
+            float4 c = src.sample(sm, uv);
+            float n = max(2.0, floor(mix(2.0, 16.0, 1.0 - p)));
+            return float4(mix(c.rgb, floor(c.rgb * n) / n, a), c.a);
+        }
+        case 8: {   // solarize — invert only above mid
+            float4 c = src.sample(sm, uv);
+            float3 s = select(c.rgb, 1.0 - c.rgb, c.rgb > 0.5);
+            return float4(mix(c.rgb, s, a), c.a);
+        }
+        case 9: {   // exposure — 0.5 is identity, +/- 3 stops
+            float4 c = src.sample(sm, uv);
+            return float4(c.rgb * exp2(mix(-3.0, 3.0, a)), c.a);
+        }
+        case 10: {  // temperature — amount warms/cools, param tints green/magenta
+            float4 c = src.sample(sm, uv);
+            float t = (a - 0.5) * 2.0;
+            float g = (p - 0.5) * 2.0;
+            float3 v = c.rgb * float3(1.0 + t * 0.4, 1.0 + g * 0.2, 1.0 - t * 0.4);
+            return float4(max(v, 0.0), c.a);
+        }
+
+        // ---- Stylise: read a neighbourhood ----
+        case 11: {  // blur
+            return gauss25(src, sm, uv, texel, a * 8.0);
+        }
+        case 12: {  // sharpen — unsharp mask
+            float4 c = src.sample(sm, uv);
+            float4 b = gauss25(src, sm, uv, texel, mix(1.0, 4.0, p));
+            return float4(c.rgb + (c.rgb - b.rgb) * a * 3.0, c.a);
+        }
+        case 13: {  // edge detect — sobel magnitude
+            float r = mix(1.0, 4.0, p);
+            float gx = 0.0, gy = 0.0;
+            for (int y = -1; y <= 1; ++y) {
+                for (int x = -1; x <= 1; ++x) {
+                    float l = luma709(src.sample(sm, uv + float2(x, y) * texel * r).rgb);
+                    float sx = float(x) * ((y == 0) ? 2.0 : 1.0);
+                    float sy = float(y) * ((x == 0) ? 2.0 : 1.0);
+                    gx += l * sx; gy += l * sy;
                 }
-                return sum / max(wsum, 1e-5);
             }
-            case 1: {   // rgb shift — channels diverge along an angle
-                float a = u.param * 6.28318;
-                float2 d = float2(cos(a), sin(a)) * texel * u.amount * 30.0;
-                float r = src.sample(sm, uv + d).r;
-                float g = src.sample(sm, uv).g;
-                float b = src.sample(sm, uv - d).b;
-                return float4(r, g, b, src.sample(sm, uv).a);
-            }
-            case 2: {   // levels — contrast about mid-grey, then gamma
-                float4 c = src.sample(sm, uv);
-                float3 v = (c.rgb - 0.5) * (1.0 + u.amount * 3.0) + 0.5;
-                v = pow(max(v, 0.0), float3(mix(0.4, 2.5, u.param)));
-                return float4(v, c.a);
-            }
-            case 3: {   // pixelate
-                float n = mix(u.resolution.x, 8.0, u.amount);
-                float2 cell = max(u.resolution / max(n, 1.0), float2(1.0));
-                float2 q = (floor(uv * u.resolution / cell) + 0.5) * cell / u.resolution;
-                return src.sample(sm, q);
-            }
-            case 4: {   // kaleidoscope
-                float2 c = uv - 0.5;
-                float ang = atan2(c.y, c.x);
-                float rad = length(c);
-                float seg = 6.28318 / max(2.0, floor(mix(2.0, 16.0, u.amount)));
-                ang = abs(fmod(ang, seg) - seg * 0.5);
-                return src.sample(sm, 0.5 + float2(cos(ang), sin(ang)) * rad);
-            }
-            case 5: {   // invert, mixed by amount
-                float4 c = src.sample(sm, uv);
-                return float4(mix(c.rgb, 1.0 - c.rgb, u.amount), c.a);
-            }
-            default:
-                return src.sample(sm, uv);
+            float e = sqrt(gx * gx + gy * gy);
+            float4 c = src.sample(sm, uv);
+            return float4(mix(c.rgb, float3(e), a), c.a);
+        }
+        case 14: {  // emboss — directional difference plus mid-grey
+            float r = mix(1.0, 4.0, p);
+            float3 d = src.sample(sm, uv - texel * r).rgb
+                     - src.sample(sm, uv + texel * r).rgb;
+            float e = luma709(d) + 0.5;
+            float4 c = src.sample(sm, uv);
+            return float4(mix(c.rgb, float3(e), a), c.a);
+        }
+        case 15: {  // glow — bright pass, blurred, added back
+            float4 c = src.sample(sm, uv);
+            float4 b = gauss25(src, sm, uv, texel, 6.0);
+            float3 bright = max(b.rgb - p, 0.0);
+            return float4(c.rgb + bright * a * 2.0, c.a);
+        }
+        case 16: {  // halftone — luma into dots on a rotated grid
+            float cell = mix(4.0, 40.0, p);
+            float2 g = uv * u.resolution / cell;
+            float ang = 0.4;
+            float2 rg = float2(g.x * cos(ang) - g.y * sin(ang),
+                               g.x * sin(ang) + g.y * cos(ang));
+            float2 f = fract(rg) - 0.5;
+            float l = luma709(src.sample(sm, (floor(rg) + 0.5) * cell / u.resolution).rgb);
+            float dot_ = step(length(f), sqrt(l) * 0.7);
+            float4 c = src.sample(sm, uv);
+            return float4(mix(c.rgb, float3(dot_), a), c.a);
+        }
+        case 17: {  // pixelate
+            float n = mix(u.resolution.x, 8.0, a);
+            float2 cell = max(u.resolution / max(n, 1.0), float2(1.0));
+            float2 q = (floor(uv * u.resolution / cell) + 0.5) * cell / u.resolution;
+            return src.sample(sm, q);
+        }
+
+        // ---- Distort: read somewhere else entirely ----
+        case 18: {  // kaleidoscope
+            float2 c = uv - 0.5;
+            float ang = atan2(c.y, c.x) + p * TAU;
+            float rad = length(c);
+            float seg = TAU / max(2.0, floor(mix(2.0, 16.0, a)));
+            ang = abs(fmod(ang, seg) - seg * 0.5);
+            return src.sample(sm, 0.5 + float2(cos(ang), sin(ang)) * rad);
+        }
+        case 19: {  // mirror — param picks the axis
+            float2 q = uv;
+            if (p < 0.33)      { q.x = 0.5 - abs(q.x - 0.5); }
+            else if (p < 0.66) { q.y = 0.5 - abs(q.y - 0.5); }
+            else               { q = 0.5 - abs(q - 0.5); }
+            return src.sample(sm, mix(uv, q, step(0.001, a)));
+        }
+        case 20: {  // twirl
+            float2 ctr = float2(p, 0.5);
+            float2 d = uv - ctr;
+            float r = length(d);
+            float ang = atan2(d.y, d.x) + (1.0 - saturate(r * 2.0)) * a * TAU;
+            return src.sample(sm, ctr + float2(cos(ang), sin(ang)) * r);
+        }
+        case 21: {  // fisheye
+            float2 ctr = float2(p, 0.5);
+            float2 d = uv - ctr;
+            float r = length(d);
+            float k = 1.0 + (a - 0.5) * 2.0;
+            return src.sample(sm, ctr + d * pow(max(r, 1e-5), k - 1.0));
+        }
+        case 22: {  // wave
+            float f = mix(2.0, 40.0, p);
+            float2 q = uv + float2(sin(uv.y * f + u.time) , cos(uv.x * f + u.time))
+                            * a * 0.05;
+            return src.sample(sm, q);
+        }
+        case 23: {  // tile
+            float n = max(1.0, floor(mix(1.0, 8.0, a)));
+            return src.sample(sm, fract(uv * n));
+        }
+        case 24: {  // slide
+            float ang = p * TAU;
+            return src.sample(sm, fract(uv + float2(cos(ang), sin(ang)) * a));
+        }
+        case 25: {  // polar
+            float2 c = uv - 0.5;
+            float2 q = float2(atan2(c.y, c.x) / TAU + 0.5, length(c) * 2.0);
+            return src.sample(sm, mix(uv, q, a));
+        }
+        case 26: {  // zoom
+            float2 ctr = float2(p, 0.5);
+            float s = mix(1.0, 0.2, a);
+            return src.sample(sm, ctr + (uv - ctr) * s);
+        }
+
+        // ---- Texture ----
+        case 27: {  // rgb shift — channels diverge along an angle
+            float ang = p * TAU;
+            float2 d = float2(cos(ang), sin(ang)) * texel * a * 30.0;
+            float4 c = src.sample(sm, uv);
+            return float4(src.sample(sm, uv + d).r, c.g, src.sample(sm, uv - d).b, c.a);
+        }
+        case 28: {  // chromatic aberration — radial, strongest at the edges
+            float2 d = (uv - 0.5) * a * 0.05;
+            float4 c = src.sample(sm, uv);
+            return float4(src.sample(sm, uv + d).r, c.g, src.sample(sm, uv - d).b, c.a);
+        }
+        case 29: {  // vignette
+            float r = length((uv - 0.5) * float2(1.0, u.resolution.y / u.resolution.x));
+            float v = smoothstep(0.75, mix(0.75, 0.1, a), r);
+            float4 c = src.sample(sm, uv);
+            return float4(c.rgb * v, c.a);
+        }
+        case 30: {  // scanlines
+            float n = mix(80.0, 900.0, p);
+            float s = 0.5 + 0.5 * sin(uv.y * n * TAU);
+            float4 c = src.sample(sm, uv);
+            return float4(c.rgb * mix(1.0, s, a), c.a);
+        }
+        case 31: {  // noise — free-running, so it needs `time`
+            float n = hash21(uv * u.resolution + u.time * 60.0);
+            float4 c = src.sample(sm, uv);
+            return float4(mix(c.rgb, c.rgb * (0.5 + n), a), c.a);
+        }
+        case 32: {  // strobe — gated on musical phase, not wall-clock
+            float phase = fract(u.beat / max(mix(4.0, 0.25, p), 0.01));
+            float g = step(phase, 0.5);
+            float4 c = src.sample(sm, uv);
+            return float4(mix(c.rgb, c.rgb * g, a), c.a);
+        }
+
+        // ---- Keying ----
+        case 33: {  // luma key — amount is the cut, param the softness
+            float4 c = src.sample(sm, uv);
+            float k = smoothstep(a, a + mix(0.001, 0.4, p), luma709(c.rgb));
+            return float4(c.rgb, c.a * k);
+        }
+        case 34: {  // chroma key — distance from a hue, param the tolerance
+            float4 c = src.sample(sm, uv);
+            float3 key = hsv2rgb(float3(a, 1.0, 1.0));
+            float d = distance(normalize(max(c.rgb, 1e-5)), normalize(key));
+            float k = smoothstep(0.0, mix(0.05, 0.9, p), d);
+            return float4(c.rgb, c.a * k);
+        }
+
+        default:
+            return src.sample(sm, uv);
         }
     }
     """
