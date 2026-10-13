@@ -10,13 +10,15 @@
 //! 8..12  payload size, little-endian u32
 //! ```
 //! Tags: `DXT1` -> BC1 (8 B/block), `DXT5` -> BC3 (16 B/block),
-//! `YCG6`/`YG10` -> BC3-shaped YCoCg.
+//! `YCG6`/`YG10` -> several separate single-channel BC4 planes, see
+//! `decompress_ycocg`.
 //!
 //! `DXT1` and `DXT5` are both derived and verified byte-exact against ffmpeg.
 //! They are **two different schemes**, not one scheme with two block sizes:
 //! DXT1 codes whole blocks with a SPLIT escape, DXT5 (ffmpeg calls it `DXTR5`)
-//! codes two independent planes — see `decompress_dxt5`. `YCG6`/`YG10` are
-//! still `NotDerived`.
+//! codes two independent planes — see `decompress_dxt5`. `YCG6`/`YG10` are a
+//! third scheme again and are still `NotDerived`; everything measured about
+//! them is recorded on `decompress_ycocg`.
 //!
 //! # Compressed stream (VERIFIED for DXT1)
 //!
@@ -271,14 +273,12 @@ pub fn decompress_dxt1(payload: &[u8], n_units: usize) -> Result<Vec<u8>, Error>
 ///
 /// # Not derived
 ///
-/// `YCG6` / `YG10` still return `NotDerived`, and they are **not** this scheme with a
+/// `YCG6` / `YG10` still return `NotDerived`. They are **not** this scheme with a
 /// header bolted on — ffmpeg names them differently in its own trace: `YOCOCG6` and
-/// `YAOCOCG10`, versus `DXTR5` here. Both carry a 16-byte header of four u32s that
-/// `DXT5` does not (`YCG6`: `11612, 2922, 0, 0` on a 12803-byte frame; `YG10`:
-/// `10270, 2391, 2081, 0` on a 20074-byte frame), consistent with sub-stream sizes
-/// for separate Y/Co/Cg(/A) planes. Feeding the bytes after that header to
-/// `decompress_dxt5` desyncs within ~30 bytes on every frame tried, so the
-/// "same scheme, extra header" shortcut is ruled out, not merely untested.
+/// `YAOCOCG10`, versus `DXTR5` here. Feeding the bytes after their header to
+/// `decompress_dxt5` desyncs immediately, so the "same scheme, extra header"
+/// shortcut is ruled out, not merely untested. See `decompress_ycocg` for what the
+/// scheme actually is.
 ///
 /// # Provenance
 ///
@@ -382,6 +382,192 @@ pub fn decompress_dxt5(payload: &[u8], n_units: usize) -> Result<Vec<u8>, Error>
         }
     }
     Ok(units_to_bytes(&out))
+}
+
+/// DXV3 `YCG6` / `YG10` — ffmpeg calls the schemes `YOCOCG6` and `YAOCOCG10`.
+/// **NOT DERIVED.** This function exists to hold the measured facts in one place and
+/// to refuse rather than guess. Everything below is labelled VERIFIED (reproduced by a
+/// named probe), HYPOTHESIS (fits all data, not isolated) or UNRESOLVED.
+///
+/// # The oracle is planar YCoCg, not RGB (VERIFIED)
+///
+/// ffmpeg's DXV decoder does **not** apply the YCoCg->RGB transform for these tags. It
+/// emits `yuv420p` (`YCG6`) / `yuva420p` (`YG10`) with colourspace tagged `ycgco`, and
+/// swscale in ffmpeg 9.0.1 cannot convert `ycgco` to RGB — `-pix_fmt rgba` fails with
+/// "Impossible to convert between the formats". So the verification target, and the
+/// only usable oracle, is:
+/// ```text
+/// ffmpeg -v error -i f.mov -frames:v N -f rawvideo -pix_fmt yuv420p  out.raw   # YCG6
+/// ffmpeg -v error -i f.mov -frames:v N -f rawvideo -pix_fmt yuva420p out.raw   # YG10
+/// ```
+/// Plane 0 = Y, planes 1/2 = Co/Cg at half resolution, plane 3 (`YG10`) = A at full
+/// resolution. **There is therefore no YCoCg->RGB integer maths to derive for
+/// byte-exactness** — it is a presentation-time concern for Photon, and ffmpeg
+/// declines to do it at all.
+///
+/// Unlike DXT5 there is **no `idx N > M` trace line** for these tags; `-v trace` adds
+/// nothing over `-v error`. Every malformed stream looks identical from outside: one
+/// `Invalid data found when processing input` and the frame is dropped (so the first
+/// RGBA/YUV frame ffmpeg emits is frame 1 — a mutation harness that forgets this
+/// silently measures "frame 0 vs frame 1" instead of "broken vs not").
+///
+/// # The name is the bit depth (VERIFIED)
+///
+/// 6 and 10 are bits per pixel, and they decompose into BC4 planes:
+/// * `YCG6`  = Y BC4 full res (4bpp) + Co BC4 half res (1bpp) + Cg BC4 half res (1bpp).
+/// * `YG10`  = the same three + A BC4 full res (4bpp).
+///
+/// Each plane is an ordinary BC4/ATI1 texture: 8-byte blocks, row-major, standard
+/// endpoint rules. Proved with a RAW frame (header byte 6 nonzero) at 1024x64 carrying
+/// one block of `a0=0, a1=255, indices 0..7`; ffmpeg returned
+/// `0, 255, 51, 102, 153, 204, 0, 255` — exactly the `a0 <= a1` six-value mode, and the
+/// 4x4 texel order is row-major (`tools/yclab.py` + a RAW `craft.dxv_frame`).
+/// Caveat: in RAW mode ffmpeg fills **only** the Y plane and leaves chroma zero at any
+/// payload size, so RAW cannot be used to probe the chroma layout.
+///
+/// # Payload header (VERIFIED)
+///
+/// Not four u32s. It is `1 + k` u32s, where `k` is the number of planes carried by the
+/// first sub-stream:
+///
+/// | tag    | header | values on the probe frame                       |
+/// |--------|--------|-------------------------------------------------|
+/// | `YCG6` | 8 B    | `h0=11612, h1=2922`   (`ringmask3.mov` frame 0)  |
+/// | `YG10` | 12 B   | `h0=632, h1=69, h2=69` (`ring2.mov` frame 0)     |
+///
+/// * `h0` = byte offset at which the first sub-stream **ends** and the chroma
+///   sub-stream begins. It must be **exact**: on `ringmask3` frame 0 every value in
+///   11605..11621 except 11612 makes ffmpeg drop the frame, at every texture size
+///   tried (64x64 through 2560x1080).
+/// * `h1` (and `h2`) are per-plane and tolerant: valid iff roughly
+///   `(enough for the decode) <= h1 <= min(block_count, align4(true_value))`. At
+///   2560x1080 only 2921..2924 are accepted; at 64x64 and 128x128 the ceiling is the
+///   block count itself (256 / 1024), which is what makes a *count* reading likely.
+/// * The old note in this file claiming a 16-byte, four-u32 header was wrong: on
+///   `tube3.mov` frame 0 words 3 and 4 hold obvious stream data (2042224616,
+///   231138931), and on `ringmask3` the first stream byte (payload[8]) demonstrably
+///   controls Y block 0.
+///
+/// HYPOTHESIS for `h1`: it is the **op count for that plane**, not an offset. Evidence:
+/// (a) the ceiling is the block count, which bounds an op count but not an offset;
+/// (b) mask words planted at `align4(h1)` change nothing, and the byte -> block-cursor
+/// map across `[8, h0)` is strictly monotone with no discontinuity at 2922/2924
+/// (measured byte-by-byte over 2900..2949: blocks 56003..56012, perfectly smooth), so
+/// it is definitely **not** a second stream start; (c) the chroma sub-stream, which
+/// needs exactly one run op per plane, carries `1, 1` in the same position.
+/// UNRESOLVED: why 2925 is rejected at 64x64 where only one op ever executes.
+///
+/// # Sub-stream shape (VERIFIED for YG10, HYPOTHESIS generally)
+///
+/// A sub-stream carrying `k` planes opens with `k` consecutive 8-byte BC4 literals —
+/// block 0 of each plane, costing no flag bits — and then runs one op stream with `k`
+/// cursors, DXT5-style. On `ring2.mov` (`YG10`) frame 0, byte mutation isolates this
+/// exactly: payload[12] moves 2,072,960 Y texels and nothing else, payload[20] moves
+/// 2,072,960 A texels and nothing else, payload[13..20] and [21..28] move nothing
+/// (both seeds have `a0 == a1 == 0`, so their index bytes are inert), and everything
+/// from payload[28] on is op data. `YCG6` has one plane here (Y), which is why its
+/// first sub-stream looks purely sequential.
+///
+/// # Y-plane ops (partially VERIFIED)
+///
+/// Positions below are payload offsets on `ringmask3.mov` frame 0 (`YCG6`, one plane,
+/// stream at `[8, 11612)`), cross-checked by synthesis in `tools/yclab2.py`.
+///
+/// | what | bytes | status |
+/// |------|-------|--------|
+/// | block 0 literal, 8 B, unflagged | 8..16 | VERIFIED |
+/// | initial RUN count, unflagged    | 16..19 | VERIFIED |
+/// | next block, 8 B literal, unflagged | 19..27 | VERIFIED |
+/// | opcode byte + record, per block | 27.. | partially VERIFIED |
+///
+/// **RUN (VERIFIED).** The count uses the *same* varint as DXT5:
+/// `n = u8; if n == 0xFF { n += u16_le }`. The run writes `n + 4` blocks, each a copy
+/// of the block before it. Two independent proofs: (a) in the lab the number of filled
+/// blocks is exactly `n + 5` (seed + n+4) at 64x64, 128x128, 256x64 and 1024x64, and
+/// the smallest `n` that decodes is exactly `block_count - 8` at all four sizes;
+/// (b) on the real frame the count bytes are `ff 31 4b` = 255 + 0x4B31 = 19504, so
+/// blocks 1..19508 are copies of the black seed — and ffmpeg's own output has its
+/// first non-black block at exactly 19509.
+///
+/// **Opcode `0x00` = whole-block literal, 8 bytes (VERIFIED).** Lab:
+/// `seed, count(248), lit(77,77), 0x00, lit(33,33)` puts 77 in block 253 and 33 in
+/// block 254.
+///
+/// **Opcode `0xDE` = partial block, 5 bytes (VERIFIED).** Layout
+/// `[a0][a1][idx3][idx4][idx5]`; index bytes 0..2 are inherited from the previous
+/// block. Proved both ways. Forwards, on real data: payload 27..56 is five of these
+/// back to back and reconstructs ffmpeg's blocks 19510..19514 texel-exactly, as does
+/// the unflagged literal at 19..26 for block 19509 — six consecutive blocks, zero
+/// mismatches. Backwards, by synthesis: after a known previous block
+/// `77 0A 49 92 24 49 92 24`, feeding `DE C8 00 49 92 0E` produced exactly the texels
+/// predicted by `C8 00 | 49 92 24 | 49 92 0E`.
+///
+/// **UNRESOLVED: the other 254 opcode values.** `tools/ycopscan.py` walks all 256 byte
+/// values in a fixed lab context; with non-zero operands only `0x00` and `0xDE` decode
+/// at all (`0xFD` decodes only when every operand byte is zero). That rules out the
+/// obvious reading of the byte as four 2-bit codes — that would make far more than
+/// three of the 256 combinations legal — and it rules out a per-byte literal/copy
+/// bitmask, which does not reproduce either known opcode. The experiment that would
+/// settle it: rerun the 256-value scan with *non-zero* operand bytes and several
+/// operand lengths while at least four blocks remain unwritten, so each opcode's byte
+/// consumption and block count can both be read off, instead of the texture filling
+/// after the first op.
+///
+/// # Chroma sub-stream (UNRESOLVED)
+///
+/// Occupies `[h0, payload_end)` and is cleanly separated: no mutation anywhere in
+/// `[8, h0)` ever moves a Co/Cg sample, and every single-byte mutation inside
+/// `[h0, end)` makes ffmpeg reject the frame.
+///
+/// The last 38 bytes have an identical shape in both a `YCG6` and a `YG10` file:
+/// ```text
+/// 22 00 00 00 | 01 00 00 00 | 01 00 00 00
+/// 80 7f db b6 6d db b6 6d        <- BC4 block: a0=128, a1=127, all indices 3 -> 127
+/// 80 7f db b6 6d db b6 6d        <- second plane, same
+/// ff fc a8                       <- varint 255 + 0xA8FC = 43515  (ringmask3)
+/// ff fc a8
+/// 00 00 00 00
+/// ```
+/// which is `[u32 34][u32 1][u32 1][two plane seeds][one RUN per plane][pad]` — the
+/// same `1 + k` header, `k` seeds, then ops shape as the first sub-stream, with
+/// `43515 + 4 >= 43200` chroma blocks for 2560x1080 and, in `ring2.mov`,
+/// `32635 + 4 >= 32400` for 1920x1080. Both files' chroma is a constant 127, so one
+/// run per plane is all it should need.
+///
+/// UNRESOLVED and the main open question for `YCG6`: that 38-byte chunk sits at the
+/// **end** of the chroma region, and the 1153 bytes between `h0` and it are not
+/// explained. They are load-bearing in both directions — splicing them out fails,
+/// pointing `h0` straight at the chunk fails, overwriting them with 0xA5 fails — and
+/// the region is read immediately: a texture needing only 1024 chroma blocks still
+/// requires the chroma stream to be present in full (truncating it to 8, 38, 512 …
+/// bytes all fail; only the full 1191 decode). Its first bytes are not a plausible
+/// BC4 seed for a constant-127 plane (`56 33 40 25 2a c0 f0 41` decodes to values in
+/// 51..86), which is what makes the "seeds are in the footer" reading tempting.
+/// The experiment that would settle it: byte-map that region on a `YCG6` file whose
+/// chroma actually varies — `tube3.mov`, 3800x640, whose frame-0 chroma is not
+/// constant — with `tools/ycbytemap.py`, and see whether the Co/Cg cursors advance
+/// forwards from `h0` or backwards from the footer.
+///
+/// # Proved false along the way
+///
+/// * Not DXT1's scheme: run from `[8, h0)` it faults at output unit 2.
+/// * Not DXT5's scheme, on either sub-stream: on the chroma stream the first op asks
+///   for source index 257192 with 420 units written.
+/// * `h1` is not a second stream start (monotone cursor map, above).
+/// * The payload header is not four u32s.
+/// * ffmpeg's RAW path for these tags is not a chroma oracle — it zero-fills chroma.
+///
+/// # Tooling
+///
+/// `tools/ycmut.py` mutates bytes inside a real `.mov` in place and reports which
+/// plane/sample first moves; `tools/yclab.py` crafts a whole frame against a
+/// same-size template (`probes3/t_*.mov`, generated with ffmpeg's own dxv encoder);
+/// `tools/yclab2.py` builds a Y stream op-by-op and borrows a real chroma tail so the
+/// only variable is the Y stream; `tools/yscore.py` scores a candidate texture by the
+/// index of the first block whose BC4-decoded texels differ from ffmpeg's;
+/// `tools/ycbytemap.py` and `tools/ycopscan.py` are the two scans cited above.
+pub fn decompress_ycocg(_payload: &[u8], _n_units: usize) -> Result<Vec<u8>, Error> {
+    Err(Error::NotDerived)
 }
 
 #[inline]
@@ -559,6 +745,8 @@ pub fn decode_texture(frame: &Frame<'_>, w: usize, h: usize) -> Result<Vec<u8>, 
     match frame.tag {
         Tag::Dxt1 => decompress_dxt1(frame.payload, n_units),
         Tag::Dxt5 => decompress_dxt5(frame.payload, n_units),
-        _ => Err(Error::NotDerived),
+        // Not a single block-compressed texture at all — several BC4 planes at mixed
+        // resolutions. `n_units` is meaningless for these; see `decompress_ycocg`.
+        Tag::Ycg6 | Tag::Yg10 => decompress_ycocg(frame.payload, n_units),
     }
 }
